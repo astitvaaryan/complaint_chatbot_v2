@@ -86,11 +86,18 @@ uvicorn app.main:app --reload
 The server will start running at `http://localhost:8000`.
 
 ### 7. Expose Server to the Internet (ngrok)
-In a **new terminal window**, start ngrok:
-```bash
-ngrok http 8000
-```
-Copy the `Forwarding` URL it gives you (e.g., `https://1234-abcd.ngrok-free.app`).
+To allow Twilio to reach your local server, you need `ngrok`.
+1. Download ngrok from [https://ngrok.com/download](https://ngrok.com/download).
+2. Unzip it and place `ngrok.exe` in your project folder (or add it to your PATH).
+3. Log in to your ngrok dashboard, copy your Authtoken, and run:
+   ```bash
+   ngrok config add-authtoken YOUR_AUTHTOKEN_HERE
+   ```
+4. In a **new terminal window**, start ngrok:
+   ```bash
+   ngrok http 8000
+   ```
+5. Copy the `Forwarding` URL it gives you (e.g., `https://1234-abcd.ngrok-free.app`).
 
 ### 8. Configure Twilio Sandbox
 1. Go to [console.twilio.com](https://console.twilio.com) and sign up for a free account.
