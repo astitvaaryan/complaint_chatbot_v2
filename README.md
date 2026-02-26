@@ -28,7 +28,7 @@ Chatbot/
 
 ---
 
-## 🚀 Setup Guide for Teammates
+## 🚀 Setup Guide
 
 Follow these steps exactly to run the chatbot on your local machine using your own Twilio testing account.
 
