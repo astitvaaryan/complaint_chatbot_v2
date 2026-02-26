@@ -70,7 +70,6 @@ SOURCE equipment_complaint.sql;
 SOURCE lab_incharge.sql;
 SOURCE facility_resources.sql;
 ```
-*(Make sure Astitva gives you the `.sql` dumps!)*
 
 ### 5. Whitelist Your Phone Number in the DB
 Since the chatbot blocks unknown numbers, you must add your own phone number to your local database to test it. Open MySQL and run:
