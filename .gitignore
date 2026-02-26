@@ -1,0 +1,13 @@
+# gitignore
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.log
+chatbot_qr_*.png
+chatbot_links.json
