@@ -8,7 +8,7 @@ twilio==9.0.5
 python-multipart==0.0.9
 PyMySQL==1.1.1
 SQLAlchemy==2.0.28
-google-generativeai==0.8.3
+google-genai
 
 # QR Code generation
 qrcode[pil]==7.4.2
