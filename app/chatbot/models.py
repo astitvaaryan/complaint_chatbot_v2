@@ -14,15 +14,39 @@ from app.chatbot.db import Base
 
 
 class Resources(Base):
-    """Equipment/machine records — matches facility_resources.sql schema."""
+    """Facility/General resources."""
     __tablename__ = "resources"
     __table_args__ = {'extend_existing': True}
 
     machid = Column(Integer, primary_key=True, index=True)
     name = Column(String(150))
     location = Column(String(250))
-    activation_status = Column(Integer)
+    isworking = Column(Integer, default=1)
     category = Column(String(50))
+
+
+class EqpProcessResource(Base):
+    """Equipment and Process resources."""
+    __tablename__ = "eqp-process_resources"
+    __table_args__ = {'extend_existing': True}
+
+    machid = Column(Integer, primary_key=True, index=True)
+    name = Column(String(150))
+    location = Column(String(250))
+    isworking = Column(Integer, default=1)
+    category = Column(String(150))
+
+
+class SafetyDevice(Base):
+    """Safety-related devices."""
+    __tablename__ = "safety_device"
+    __table_args__ = {'extend_existing': True}
+
+    device_id = Column(Integer, primary_key=True, index=True)
+    device_name = Column(String(200)) # Note: named device_name in SQL
+    location = Column(String(250))
+    isworking = Column(Integer, default=1)
+    category = Column(String(255))
 
 
 class LabIncharge(Base):
@@ -59,3 +83,12 @@ class ConversationState(Base):
     user_phone = Column(String(40), unique=True, index=True, nullable=False)
     current_step = Column(String(100), nullable=False)
     collected_data = Column(Text, nullable=False)
+
+
+class ComplaintKeyword(Base):
+    """Keywords extracted from CSV datasets to improve classification accuracy."""
+    __tablename__ = "complaint_it_keywords"
+
+    id = Column(Integer, primary_key=True, index=True)
+    keyword = Column(String(100), unique=True, index=True, nullable=False)
+    type = Column(Integer, nullable=False) # 1=Equipment ... 10=Admin

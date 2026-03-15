@@ -3,19 +3,23 @@ app/chatbot/engine.py
 ─────────────────────────────────────────
 Main chatbot logic engine.
 
-Flow (single machine found):
-  1. User sends "DG SET not working"
-  2. Machine matched → type auto-classified → complaint logged
+Classification pipeline (see classifier.py):
+  Layer 1-A  Machine DB category → type  (instant)
+  Layer 1-B  Keyword scoring             (instant, augmented from Kaggle CSV)
+  Layer 2    Gemini 2.0 Flash API        (only when L1 fails)
+  Fallback   Ask user to clarify once → then show manual menu
 
-Flow (multiple machines found):
-  1. User sends "Dehumidifier has issue"
-  2. Bot sends numbered list of matches
-  3. User replies "2"
-  4. Bot logs complaint for machine #2
-
-Complaint Types:
+Complaint Types in this system:
   1=Equipment, 2=Facility, 3=Safety, 4=Process,
-  5=HR, 6=IT, 7=Purchase, 8=Training, 9=Inventory, 10=Admin
+  5=HR, 6=IT, 7=Purchase, 10=Admin
+
+Conversation steps:
+  waiting_for_problem        — need the issue description from the user
+  waiting_for_selection      — user picks one of several matched machines
+  waiting_for_narrowing      — too many matches; narrowing by location first
+  waiting_for_location       — known/unknown machine but location missing
+  waiting_for_clarification  — classifier returned None; ask to rephrase
+  waiting_for_type_selection — second failure; show manual type-number menu
 """
 
 import json
@@ -24,7 +28,7 @@ import traceback
 from app.chatbot.db import SessionLocal
 from app.chatbot import models
 from app.chatbot.extractor import extract_machine_db
-from app.chatbot.classifier import classify_complaint_type, extract_unknown_equipment
+from app.chatbot.classifier import classify_complaint_type, extract_unknown_equipment, extract_unknown_smart, keyword_match
 from app.chatbot.state_manager import get_state, upsert_state, clear_state, parse_collected_data
 
 # Complaint type display names (1-10)
@@ -34,6 +38,10 @@ TYPE_NAMES = {
     7: "Purchase",  8: "Training",  9: "Inventory",
     10: "Admin"
 }
+
+# Types that do NOT require a physical machine / location
+# 2=Facility, 3=Safety, 5=HR, 6=IT, etc.
+NON_EQUIPMENT_TYPES = {2, 3, 5, 6, 7, 8, 9, 10}
 
 
 def _resolve_lab_location(db, location_str: str):
@@ -70,13 +78,17 @@ def _resolve_lab_location(db, location_str: str):
     return location_str, None, None
 
 
-def _log_complaint(db, member_id: int, machine: models.Resources, description: str, location_name, location_id, complaint_type: int) -> str:
+def _log_complaint(db, member_id: int, machine: any, description: str, location_name, location_id, complaint_type: int) -> str:
     """Log complaint to DB and return confirmation message."""
     type_name = TYPE_NAMES.get(complaint_type, "Equipment")
+    
+    # Normalize attributes based on class type
+    m_name = getattr(machine, "name", getattr(machine, "device_name", "Unknown Machine"))
+    m_id = getattr(machine, "machid", getattr(machine, "device_id", None))
 
     new_complaint = models.Complaint(
         member_id=member_id,
-        machine_id=machine.machid,
+        machine_id=m_id,
         location_name=location_name or str(machine.location),
         location_id=location_id,
         complaint_description=description,
@@ -86,10 +98,10 @@ def _log_complaint(db, member_id: int, machine: models.Resources, description: s
     db.add(new_complaint)
     db.commit()
 
-    print(f"✅ Complaint logged: {machine.name} | Type: {type_name} ({complaint_type}) | Member: {member_id}")
+    print(f"✅ Complaint logged: {m_name} | Type: {type_name} ({complaint_type}) | Member: {member_id}")
 
     return (
-        f"Got it! I've logged your complaint for *{machine.name}* at {location_name or machine.location}. "
+        f"Got it! I've logged your complaint for *{m_name}* at {location_name or machine.location}. "
         f"Our team will look into it shortly. 👍\n"
         f"_(Ref: {type_name} complaint — Status: Open)_"
     )
@@ -149,17 +161,30 @@ def get_chatbot_reply(user: dict, message: str) -> str:
                 return "You don't have any recent complaints to delete! 🤔"
 
         if state:
-            # Universal escape hatchet: if user starts a NEW complaint,
-            # we clear the stale state and proceed as a fresh query.
-            # EXCEPTION: If we are actively waiting for a problem description, don't clear!
-            issue_keywords = {"not working", "issue", "problem", "broken", "fault",
-                              "error", "failed", "repair", "down", "stopped"}
-            is_new_complaint = any(kw in msg_lower_check for kw in issue_keywords)
+            # ── UNIVERSAL ESCAPE HATCH ──
+            # If user starts a NEW specific complaint while in a menu, clear state.
+            # We check if:
+            # 1. Message contains a known machine name from DB
+            # 2. Message has a very clear category match (Layer 1 scoring)
+            # 3. Message contains "issue" keywords and NOT a menu digit
             
-            if is_new_complaint and state.current_step != "waiting_for_problem":
-                clear_state(db, user_phone)
-                state = None
-                print(f"[ENGINE] Stale state cleared — new complaint detected: '{message}'")
+            is_digit = message.strip().isdigit()
+            
+            # Categories that are usually "sticky" until answered
+            PRESERVE_STEPS = {"waiting_for_problem"} 
+            
+            new_machines = extract_machine_db(message, db)
+            high_conf_type = keyword_match(message) # Only returns if confident
+            
+            issue_keywords = {"is not", "isnt", "broken", "spill", "leak", "stopped", "fault", "off"}
+            has_issue_words = any(kw in msg_lower_check for kw in issue_keywords)
+
+            # If it's a confident new machine or strong keywords, and user didn't just send a number
+            if (new_machines or high_conf_type or has_issue_words) and not is_digit:
+                if state.current_step not in PRESERVE_STEPS:
+                    clear_state(db, user_phone)
+                    state = None
+                    print(f"[ENGINE] Escape Hatch: Clear state '{state}' for new input: '{message}'")
 
         # ── STEP: User provided the problem description ──────────────
         if state and state.current_step == "waiting_for_problem":
@@ -174,7 +199,15 @@ def get_chatbot_reply(user: dict, message: str) -> str:
             type_name = TYPE_NAMES.get(complaint_type, "Equipment")
             
             if machine_id: # known machine
-                machine = db.query(models.Resources).filter(models.Resources.machid == machine_id).first()
+                m_type = data.get("model_type", "Resources")
+                # Precise re-query based on stored model type
+                if m_type == "SafetyDevice":
+                    machine = db.query(models.SafetyDevice).filter(models.SafetyDevice.device_id == machine_id).first()
+                elif m_type == "EqpProcessResource":
+                    machine = db.query(models.EqpProcessResource).filter(models.EqpProcessResource.machid == machine_id).first()
+                else:
+                    machine = db.query(models.Resources).filter(models.Resources.machid == machine_id).first()
+
                 clear_state(db, user_phone)
                 return _log_complaint(db, member_id, machine, complaint_desc, location_name, location_id, complaint_type)
             else: # unknown machine or general complaint bypasses _log_complaint
@@ -196,6 +229,123 @@ def get_chatbot_reply(user: dict, message: str) -> str:
                     f"_(Ref: {type_name} complaint — Status: Open)_"
                 )
 
+        # ── STEP: Classifier returned None → asked user to clarify ────
+        if state and state.current_step == "waiting_for_clarification":
+            data          = parse_collected_data(state)
+            original_msg  = data.get("original_message", "")
+            machine_id    = data.get("machine_id")
+
+            # Try to classify the new rephrased message
+            clarified_type = classify_complaint_type(message)
+
+            if clarified_type is not None:
+                # Great — we now know the type; proceed normally
+                clear_state(db, user_phone)
+                complaint_type = clarified_type
+                type_name = TYPE_NAMES.get(complaint_type, "General")
+                
+                if complaint_type in NON_EQUIPMENT_TYPES:
+                    new_complaint = models.Complaint(
+                        member_id=member_id, machine_id=None,
+                        location_name="N/A", location_id=None,
+                        complaint_description=f"{original_msg} | {message}".strip(" |"),
+                        type=complaint_type, status="Open"
+                    )
+                    db.add(new_complaint)
+                    db.commit()
+                    return (
+                        f"Noted! Your *{type_name}* complaint has been logged. 👍\n"
+                        f"_(Status: Open)_"
+                    )
+
+                if machine_id:
+                    machine = db.query(models.Resources).filter(
+                        models.Resources.machid == machine_id).first()
+                    if machine:
+                        location_name, location_id, _ = _resolve_lab_location(db, str(machine.location))
+                        return _log_complaint(db, member_id, machine, message,
+                                             location_name, location_id, complaint_type)
+
+                # Unknown equipment — fall through to location step
+                machine_name = data.get("machine_name", "Unknown Equipment")
+                upsert_state(db, user_phone, "waiting_for_location", {
+                    "machine_name": machine_name, "complaint_type": complaint_type,
+                    "original_message": message, "member_id": member_id,
+                })
+                return (f"Got it! Which lab or room is *{machine_name}* located in?")
+
+            # Still unclear → escalate to manual menu
+            clear_state(db, user_phone)
+            MANUAL_MENU = (
+                "I'm still not sure what type of complaint this is. "
+                "Please pick a number:\n\n"
+                "1️⃣  Equipment (lab machines)\n"
+                "2️⃣  Facility (AC, power, building)\n"
+                "3️⃣  Safety (fire, spill, hazard)\n"
+                "4️⃣  Process (recipe, yield)\n"
+                "5️⃣  HR (salary, leave, payroll)\n"
+                "6️⃣  IT (laptop, wifi, software)\n"
+                "7️⃣  Purchase (order, vendor, spares)\n"
+                "8️⃣  Training (workshop, course, seminar)\n"
+                "9️⃣  Inventory (stock, missing items, spares)\n"
+                "🔟  Admin (documents, policy, access)"
+            )
+            upsert_state(db, user_phone, "waiting_for_type_selection", {
+                "original_message": original_msg or message,
+                "machine_id":       machine_id,
+                "machine_name":     data.get("machine_name", "Unknown Equipment"),
+            })
+            return MANUAL_MENU
+
+        # ── STEP: Manual type-number selection menu ───────────────────
+        if state and state.current_step == "waiting_for_type_selection":
+            data           = parse_collected_data(state)
+            original_msg   = data.get("original_message", message)
+            machine_id     = data.get("machine_id")
+            machine_name   = data.get("machine_name", "Unknown Equipment")
+            ALLOWED_INPUTS = {"1":1, "2":2, "3":3, "4":4, "5":5,
+                              "6":6, "7":7, "8":8, "9":9, "10":10}
+
+            selection = message.strip()
+            if selection in ALLOWED_INPUTS:
+                complaint_type = ALLOWED_INPUTS[selection]
+                type_name      = TYPE_NAMES.get(complaint_type, "General")
+                if complaint_type in NON_EQUIPMENT_TYPES:
+                    new_complaint = models.Complaint(
+                        member_id=member_id, machine_id=None,
+                        location_name="N/A", location_id=None,
+                        complaint_description=original_msg,
+                        type=complaint_type, status="Open"
+                    )
+                    db.add(new_complaint)
+                    db.commit()
+                    return (
+                        f"Done! Your *{type_name}* complaint has been logged. 👍\n"
+                        f"_(Status: Open)_"
+                    )
+
+                if machine_id:
+                    machine = db.query(models.Resources).filter(
+                        models.Resources.machid == machine_id).first()
+                    if machine:
+                        location_name, location_id, _ = _resolve_lab_location(db, str(machine.location))
+                        return _log_complaint(db, member_id, machine, original_msg,
+                                             location_name, location_id, complaint_type)
+
+                # Unknown equipment path
+                upsert_state(db, user_phone, "waiting_for_location", {
+                    "machine_name": machine_name, "complaint_type": complaint_type,
+                    "original_message": original_msg, "member_id": member_id,
+                })
+                return (f"Got it! Which lab or room is *{machine_name}* located in?")
+
+            # Invalid menu input
+            return (
+                "Please reply with just the number from the list:\n"
+                "1 Equipment · 2 Facility · 3 Safety · 4 Process\n"
+                "5 HR · 6 IT · 7 Purchase · 8 Training · 9 Inventory · 10 Admin"
+            )
+
         # ── STEP: User selecting from numbered list ─────────────────
         if state and state.current_step == "waiting_for_selection":
             data = parse_collected_data(state)
@@ -209,10 +359,16 @@ def get_chatbot_reply(user: dict, message: str) -> str:
                 if 0 <= idx < len(machines_data):
                     machine_info = machines_data[idx]
 
-                    # Re-query the actual machine object
-                    machine = db.query(models.Resources).filter(
-                        models.Resources.machid == machine_info["machid"]
-                    ).first()
+                    # Re-query the actual machine object from the SPECIFIC table (prevents ID collisions)
+                    m_type = machine_info.get("model_type", "Resources")
+                    mid = machine_info["machid"]
+                    
+                    if m_type == "SafetyDevice":
+                        machine = db.query(models.SafetyDevice).filter(models.SafetyDevice.device_id == mid).first()
+                    elif m_type == "EqpProcessResource":
+                        machine = db.query(models.EqpProcessResource).filter(models.EqpProcessResource.machid == mid).first()
+                    else:
+                        machine = db.query(models.Resources).filter(models.Resources.machid == mid).first()
 
                     if machine:
                         clear_state(db, user_phone)
@@ -221,8 +377,9 @@ def get_chatbot_reply(user: dict, message: str) -> str:
                         
                         if needs_issue_description(original_msg):
                             upsert_state(db, user_phone, "waiting_for_problem", {
-                                "machine_id": machine.machid,
-                                "machine_name": machine.name,
+                                "machine_id": getattr(machine, 'machid', getattr(machine, 'device_id', None)),
+                                "model_type": type(machine).__name__,
+                                "machine_name": getattr(machine, 'name', getattr(machine, 'device_name', '')),
                                 "location_name": location_name,
                                 "location_id": location_id,
                                 "complaint_type": complaint_type
@@ -231,11 +388,45 @@ def get_chatbot_reply(user: dict, message: str) -> str:
 
                         return _log_complaint(db, member_id, machine, original_msg, location_name, location_id, complaint_type)
 
+                elif idx == len(machines_data):
+                    # Use the full intelligent pipeline (DB -> Key -> Gemini)
+                    complaint_type = classify_complaint_type(original_msg) or 1
+                    
+                    # ── Logic Shift: If it's a non-equipment type, don't ask for a machine/location ──
+                    if complaint_type in NON_EQUIPMENT_TYPES:
+                        type_name_friendly = TYPE_NAMES.get(complaint_type, "General")
+                        
+                        # Always ask for details instead of logging directly
+                        upsert_state(db, user_phone, "waiting_for_problem", {
+                            "machine_id":    None,
+                            "machine_name":  "General Request",
+                            "location_name": "N/A",
+                            "location_id":   None,
+                            "complaint_type": complaint_type
+                        })
+                        return f"Got it, this sounds like a *{type_name_friendly}* request. Could you give me a bit more detail about the issue?"
+
+                    # ── Conversational Extraction ──────────────────────
+                    # Instead of "Unknown Equipment", get a smart name (e.g., "Lighting", "AC")
+                    machine_name = extract_unknown_smart(original_msg)
+                    
+                    upsert_state(db, user_phone, "waiting_for_location", {
+                        "machine_name": machine_name,
+                        "complaint_type": complaint_type,
+                        "original_message": original_msg,
+                        "member_id": member_id,
+                    })
+                    
+                    if machine_name in ["this issue", "item"]:
+                        return "Got it! Which lab or room are you talking about?"
+                    return f"Okay! Which lab or room is the *{machine_name}* located in?"
+
             # Invalid selection
             options = "\n".join(
                 [f"{i+1}. {m['name']} — {m['location']}"
                  for i, m in enumerate(machines_data)]
             )
+            options += f"\n{len(machines_data) + 1}. Other (Not listed)"
             return (
                 f"Hmm, just send the number next to the machine you mean 😊\n\n"
                 f"{options}"
@@ -256,21 +447,50 @@ def get_chatbot_reply(user: dict, message: str) -> str:
                 idx = int(user_input) - 1
                 if 0 <= idx < len(unique_locs):
                     location_filter = unique_locs[idx].lower()
+                elif idx == len(unique_locs):
+                    # Use the full intelligent pipeline (DB -> Key -> Gemini)
+                    complaint_type = classify_complaint_type(original_msg) or 1
+                    
+                    if complaint_type in NON_EQUIPMENT_TYPES:
+                        type_name_friendly = TYPE_NAMES.get(complaint_type, "General")
+                        
+                        # Always ask for details instead of logging directly
+                        upsert_state(db, user_phone, "waiting_for_problem", {
+                            "machine_id":    None,
+                            "machine_name":  "General Request",
+                            "location_name": "N/A",
+                            "location_id":   None,
+                            "complaint_type": complaint_type
+                        })
+                        return f"I understand this is a *{type_name_friendly}* request. What exactly is the issue or details?"
+
+                    # Otherwise, proceed to unknown location flow
+                    result = extract_unknown_equipment(original_msg)
+                    machine_name = result["machine_name"]
+                    upsert_state(db, user_phone, "waiting_for_location", {
+                        "machine_name": machine_name,
+                        "complaint_type": complaint_type,
+                        "original_message": original_msg,
+                        "member_id": member_id,
+                    })
+                    return f"Okay! Which lab or room is *{machine_name}* located in?"
             
             # If not a digit, fall back to loose string matching
             if not location_filter:
                 location_filter = user_input
 
-            # Filter stored candidates by location string
+            # Filter stored candidates by location, name, or category string
             narrowed = [
                 m for m in all_machines
-                if location_filter in m["location"].lower() or
-                   location_filter in m["name"].lower()
+                if location_filter in (str(m.get("location") or "")).lower() or
+                   location_filter in (str(m.get("name") or "")).lower() or
+                   location_filter in (str(m.get("category") or "")).lower()
             ]
 
             if not narrowed:
                 # Location not recognized — tell user and re-show valid options
                 locs_text = "\n".join(f"{i+1}. {loc}" for i, loc in enumerate(unique_locs))
+                locs_text += f"\n{len(unique_locs) + 1}. Other (Not listed)"
                 return (
                     f"I couldn't find *'{message.strip()}'* in our lab list. Could you try sending one of these numbers?\n\n"
                     f"{locs_text}"
@@ -286,6 +506,7 @@ def get_chatbot_reply(user: dict, message: str) -> str:
                 [f"{i+1}. {m['name']} — {m['location']}"
                  for i, m in enumerate(narrowed)]
             )
+            options += f"\n{len(narrowed) + 1}. Other (Not listed)"
             return f"Here's what I found in that area. Which one is it?\n\n{options}"
 
         # ── STEP: User provided location for unknown equipment ─────
@@ -334,80 +555,66 @@ def get_chatbot_reply(user: dict, message: str) -> str:
 
         matched = extract_machine_db(message, db)
 
-        # ── No machine found → unknown equipment flow ──────────────
+        # ── No machine found → classify & route by complaint type ───
         if not matched:
-            # ── Keyword fallback BEFORE Gemini (works even if Gemini fails) ──
-            KEYWORD_FALLBACK = {
-                3:  ["fire", "hazard", "safety", "accident", "emergency", "leak", "gas", "toxic", "smoke"],
-                5:  ["salary", "leave", "hr", "payroll", "attendance", "holiday", "increment", "refund", "reimbursement", "payment", "bill", "invoice"],
-                6:  ["laptop", "wifi", "internet", "software", "computer", "network", "email", "vpn"],
-                7:  ["purchase", "order", "buy", "vendor", "quote", "chemical", "spare", "procurement"],
-                8:  ["training", "workshop", "course", "seminar", "certification", "demo"],
-                9:  ["inventory", "stock", "quantity", "missing", "spare parts"],
-                10: ["admin", "permission", "access", "policy", "approval", "letter", "document"],
-            }
-            msg_lower_kw = message.lower()
-            keyword_type = None
-            for t, kws in KEYWORD_FALLBACK.items():
-                if any(kw in msg_lower_kw for kw in kws):
-                    keyword_type = t
-                    break
+            # First, classify the complaint without heavy extraction
+            complaint_type = classify_complaint_type(message)   # may return None
 
-            # Use Gemini to extract machine name + type from message
-            extracted = extract_unknown_equipment(message)
-            machine_name = extracted["machine_name"]
-            
-            # Unconditionally trust local keyword matches over Gemini's guess
-            complaint_type = extracted["complaint_type"]
-            if keyword_type:
-                complaint_type = keyword_type
-                print(f"[ENGINE] Keyword override: type → {complaint_type}")
+            # ── Classifier failed → ask user to clarify (once) ────────
+            if complaint_type is None:
+                upsert_state(db, user_phone, "waiting_for_clarification", {
+                    "original_message": message,
+                    "machine_name":     "Unknown Equipment",
+                    "machine_id":       None,
+                })
+                return (
+                    "🤔 I'm not sure what kind of issue that is. "
+                    "Could you describe the problem in a bit more detail? "
 
-            # Non-equipment types (HR, IT, Admin, Safety, Purchase, Training, Inventory)
-            # don't need a physical location — log directly
-            NON_EQUIPMENT_TYPES = {3, 5, 6, 7, 8, 9, 10}  # Safety, HR, IT, Purchase, Training, Inventory, Admin
+                )
 
             if complaint_type in NON_EQUIPMENT_TYPES:
+                type_name_friendly = TYPE_NAMES.get(complaint_type, "General")
                 if needs_issue_description(message):
                     upsert_state(db, user_phone, "waiting_for_problem", {
-                        "machine_id": None,
-                        "machine_name": "General Request",
+                        "machine_id":    None,
+                        "machine_name":  "General Request",
                         "location_name": "N/A",
-                        "location_id": None,
+                        "location_id":   None,
                         "complaint_type": complaint_type
                     })
-                    type_name_friendly = TYPE_NAMES.get(complaint_type, "General").lower()
-                    return f"You want to log an {type_name_friendly} request. What exactly is the issue or details?"
+                    return (
+                        f"You want to log a *{type_name_friendly}* request. "
+                        f"What exactly is the issue or details?"
+                    )
 
                 new_complaint = models.Complaint(
-                    member_id=member_id,
-                    machine_id=None,
-                    location_name="N/A",
-                    location_id=None,
+                    member_id=member_id, machine_id=None,
+                    location_name="N/A", location_id=None,
                     complaint_description=message,
-                    type=complaint_type,
-                    status="Open"
+                    type=complaint_type, status="Open"
                 )
                 db.add(new_complaint)
                 db.commit()
-                type_name = TYPE_NAMES.get(complaint_type, "General")
-                print(f"✅ Non-equipment complaint: {machine_name} | Type: {type_name}")
+                print(f"✅ Non-equipment complaint logged | Type: {type_name_friendly}")
                 return (
-                    f"Noted! Your {type_name} request has been logged and will be taken up soon. 👍\n"
+                    f"Noted! Your *{type_name_friendly}* complaint has been logged. 👍\n"
                     f"_(Status: Open)_"
                 )
 
-            # Equipment / Facility types → ask for location
+            # Equipment / Facility / Process → need a physical location
+            extracted = extract_unknown_equipment(message)
+            machine_name = extracted["machine_name"]
+            
             upsert_state(db, user_phone, "waiting_for_location", {
-                "machine_name": machine_name,
+                "machine_name":   machine_name,
                 "complaint_type": complaint_type,
                 "original_message": message,
-                "member_id": member_id,
+                "member_id":      member_id,
             })
-
             return (
-                f"Hmm, I don't have *{machine_name}* in my database yet. "
-                f"Which lab or room is it in? Just type the name and I'll log it for you."
+                f"Hmm, I don't recognize *{machine_name}* in my database yet. "
+                f"Is it located in a specific lab or room? Just tell me where it is, and I'll log it for you."
             )
 
 
@@ -415,34 +622,36 @@ def get_chatbot_reply(user: dict, message: str) -> str:
         if len(matched) == 1:
             machine = matched[0]
             location_name, location_id, _ = _resolve_lab_location(db, str(machine.location))
+            m_name = getattr(machine, "name", getattr(machine, "device_name", "Unknown Machine"))
 
             # If location is missing/unresolvable → ask user
             if not location_name or location_name.strip() in ["", "None", "0", "none"]:
                 complaint_type = classify_complaint_type(message, machine)
                 upsert_state(db, user_phone, "waiting_for_location", {
-                    "machine_name": machine.name,
-                    "machine_id": machine.machid,
+                    "machine_name": m_name,
+                    "machine_id": getattr(machine, "machid", getattr(machine, "device_id", None)),
                     "complaint_type": complaint_type,
                     "original_message": message,
                     "member_id": member_id,
                 })
                 return (
-                    f"I found *{machine.name}* but its location isn't set in our system yet. "
+                    f"I found *{m_name}* but its location isn't set in our system yet. "
                     f"Which lab or room is it in?"
                 )
 
-            complaint_type = classify_complaint_type(message, machine)
-            
+            complaint_type = classify_complaint_type(message, machine) or 1  # default Equipment if unclear
+
             if needs_issue_description(message):
                 upsert_state(db, user_phone, "waiting_for_problem", {
-                    "machine_id": machine.machid,
-                    "machine_name": machine.name,
+                    "machine_id":    getattr(machine, "machid", getattr(machine, "device_id", None)),
+                    "model_type":    type(machine).__name__,
+                    "machine_name":  m_name,
                     "location_name": location_name,
-                    "location_id": location_id,
+                    "location_id":   location_id,
                     "complaint_type": complaint_type
                 })
-                return f"Got it, you mean *{machine.name}*. What exact issue are you facing with it?"
-                
+                return f"Got it, you mean *{m_name}*. What exact issue are you facing with it?"
+
             return _log_complaint(db, member_id, machine, message, location_name, location_id, complaint_type)
 
         # ── Multiple matches → bulk-load locations, then decide ────
@@ -461,9 +670,11 @@ def get_chatbot_reply(user: dict, message: str) -> str:
         machines_data = []
         for m in matched:
             machines_data.append({
-                "machid": m.machid,
-                "name": m.name,
-                "location": resolve_loc(m.location)
+                "machid": getattr(m, "machid", getattr(m, "device_id", None)),
+                "model_type": type(m).__name__,
+                "name": getattr(m, "name", getattr(m, "device_name", "Unknown Machine")),
+                "location": resolve_loc(m.location),
+                "category": m.category
             })
 
         # If too many matches → ask for location to narrow down FIRST
@@ -476,6 +687,7 @@ def get_chatbot_reply(user: dict, message: str) -> str:
                 "member_id": member_id,
             })
             locs_text = "\n".join(f"{i+1}. {loc}" for i, loc in enumerate(unique_locs))
+            locs_text += f"\n{len(unique_locs) + 1}. Other (Not listed)"
             return (
                 f"I found {len(matched)} machines with that name across different labs. "
                 f"Please reply with the number for your lab:\n\n{locs_text}"
@@ -491,6 +703,7 @@ def get_chatbot_reply(user: dict, message: str) -> str:
             [f"{i+1}. {m['name']} — {m['location']}"
              for i, m in enumerate(machines_data)]
         )
+        options += f"\n{len(machines_data) + 1}. Other (Not listed)"
         return (
             f"I found a few matches. Which one are you referring to?\n\n"
             f"{options}"

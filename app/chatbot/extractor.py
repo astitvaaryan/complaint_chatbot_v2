@@ -19,7 +19,8 @@ from app.chatbot import models
 # Words that carry no machine-name meaning — stripped before prefix matching
 STOP_WORDS = {
     "has", "have", "not", "the", "and", "for", "with", "this", "that",
-    "issue", "problem", "working", "broken", "fault", "repair", "fix",
+    "issue", "problem", "working", "workng", "workin", "works", "worked",
+    "broken", "fault", "repair", "fix", "fail", "failed", "failure",
     "since", "down", "off", "from", "there", "its", "our", "please",
     "help", "check", "seems", "started", "stopped", "suddenly", "always",
     # IT/office words that should NOT match lab equipment names
@@ -61,7 +62,7 @@ def _is_prefix_boundary(name_norm: str, query: str) -> bool:
     return next_char in ('_', ' ', '-', '/', '.')
 
 
-def extract_machine_candidates(message: str, machines: Iterable[models.Resources]) -> List[models.Resources]:
+def extract_machine_candidates(message: str, machines: List[any]) -> List[any]:
     """
     Return matched machines using 3-level priority:
     1. Exact full name in message
@@ -72,33 +73,39 @@ def extract_machine_candidates(message: str, machines: Iterable[models.Resources
     msg_tokens = _tokenize(message)
     query = _extract_machine_query(message)
 
-    exact_matches: List[models.Resources] = []
-    prefix_matches: List[models.Resources] = []
-    partial_matches: List[models.Resources] = []
+    exact_matches = []
+    prefix_matches = []
+    partial_matches = []
 
     for machine in machines:
-        name_norm = _normalize_text(machine.name or "")
-        if not name_norm:
-            continue
+        # Normalize attributes based on class type
+        if hasattr(machine, 'device_name'):
+            name = machine.device_name
+            obj_id = machine.device_id
+        else:
+            name = machine.name
+            obj_id = machine.machid
 
-        # Level 1: Exact full name appears in message
-        exact_pattern = rf"\b{re.escape(name_norm)}\b"
-        if re.search(exact_pattern, msg_norm):
+        name_norm = _normalize_text(name or "")
+        cat_norm  = _normalize_text(machine.category or "")
+        
+        # Level 1: Exact full name or category appears in message
+        if (name_norm and re.search(rf"\b{re.escape(name_norm)}\b", msg_norm)) or \
+           (cat_norm and re.search(rf"\b{re.escape(cat_norm)}\b", msg_norm)):
             exact_matches.append(machine)
             continue
 
-        # Level 2: Prefix boundary match
-        if query and _is_prefix_boundary(name_norm, query):
+        # Level 2: Prefix boundary match (Name or Category)
+        if query and (_is_prefix_boundary(name_norm, query) or _is_prefix_boundary(cat_norm, query)):
             prefix_matches.append(machine)
             continue
 
-        # Level 3: Dynamic token overlap threshold
-        # - 1 meaningful token in message (e.g. "ac") → need 1 overlap
-        # - 2+ meaningful tokens (e.g. "spin coater") → need 2 overlaps
-        #   This prevents "Spin AC_1" falsely matching "spin coater"
+        # Level 3: Token overlap fallback
         name_tokens = _tokenize(name_norm)
+        cat_tokens  = _tokenize(cat_norm)
         meaningful_msg_tokens = msg_tokens - STOP_WORDS
-        overlap = name_tokens.intersection(meaningful_msg_tokens)
+        
+        overlap = (name_tokens | cat_tokens).intersection(meaningful_msg_tokens)
         required = 1 if len(meaningful_msg_tokens) <= 1 else 2
         if len(overlap) >= required:
             partial_matches.append(machine)
@@ -113,13 +120,16 @@ def extract_machine_candidates(message: str, machines: Iterable[models.Resources
     unique = []
     seen = set()
     for machine in partial_matches:
-        if machine.machid not in seen:
-            seen.add(machine.machid)
+        mid = getattr(machine, 'machid', getattr(machine, 'device_id', None))
+        mtype = type(machine).__name__
+        key = (mtype, mid)
+        if mid is not None and key not in seen:
+            seen.add(key)
             unique.append(machine)
     return unique
 
 
-def narrow_by_location(message: str, machines: Iterable[models.Resources]) -> List[models.Resources]:
+def narrow_by_location(message: str, machines: List[any]) -> List[any]:
     """Narrow candidates by location string mentioned in the message."""
     msg_norm = _normalize_text(message)
     narrowed = [
@@ -130,15 +140,18 @@ def narrow_by_location(message: str, machines: Iterable[models.Resources]) -> Li
     return narrowed
 
 
-def extract_machine_db(message: str, db) -> List[models.Resources]:
+def extract_machine_db(message: str, db) -> List[any]:
     """
-    Main entry point: query only ACTIVE machines, then apply smart matching.
+    Main entry point: query multiple tables, then apply smart matching.
     """
-    all_machines = db.query(models.Resources).filter(
-        models.Resources.activation_status == 1
-    ).all()
+    # 1. Fetch from all 3 tables
+    facility_list = db.query(models.Resources).filter(models.Resources.isworking == 1).all()
+    eqp_list      = db.query(models.EqpProcessResource).filter(models.EqpProcessResource.isworking == 1).all()
+    safety_list   = db.query(models.SafetyDevice).filter(models.SafetyDevice.isworking == 1).all()
 
-    candidates = extract_machine_candidates(message, all_machines)
+    all_candidates = facility_list + eqp_list + safety_list
+
+    candidates = extract_machine_candidates(message, all_candidates)
 
     # If still multiple after matching, try location narrowing
     if len(candidates) > 1:
