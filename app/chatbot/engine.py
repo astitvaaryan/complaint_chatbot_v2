@@ -1,42 +1,42 @@
-"""
-app/chatbot/engine.py
-─────────────────────────────────────────
-Main chatbot logic engine.
-
-Classification pipeline (see classifier.py):
-  Layer 1-A  Machine DB category → type  (instant)
-  Layer 1-B  Keyword scoring             (instant, augmented from Kaggle CSV)
-  Layer 2    Gemini 2.0 Flash API        (only when L1 fails)
-  Fallback   Ask user to clarify once → then show manual menu
-
-Complaint Types in this system:
-  1=Equipment, 2=Facility, 3=Safety, 4=Process,
-  5=HR, 6=IT, 7=Purchase, 10=Admin
-
-Conversation steps:
-  waiting_for_problem        — need the issue description from the user
-  waiting_for_selection      — user picks one of several matched machines
-  waiting_for_narrowing      — too many matches; narrowing by location first
-  waiting_for_location       — known/unknown machine but location missing
-  waiting_for_clarification  — classifier returned None; ask to rephrase
-  waiting_for_type_selection — second failure; show manual type-number menu
-"""
+"""Schema-driven complaint engine with typed resource-table lookups."""
 
 import json
-import difflib
+import re
 import traceback
-from app.chatbot.db import SessionLocal
-from app.chatbot import models
-from app.chatbot.extractor import extract_machine_db
-from app.chatbot.classifier import classify_complaint_type, extract_unknown_equipment, extract_unknown_smart, keyword_match
-from app.chatbot.state_manager import get_state, upsert_state, clear_state, parse_collected_data
+from datetime import datetime
 
-# Complaint type display names (1-10)
+from app.chatbot import models
+from app.chatbot.classifier import classify_complaint_type, extract_complaint_schema
+from app.chatbot.db import SessionLocal
+from app.chatbot.extractor import RESOURCE_TABLE_MAP, search_resource_candidates
+from app.chatbot.state_manager import clear_state, get_state, parse_collected_data, upsert_state
+
 TYPE_NAMES = {
-    1: "Equipment", 2: "Facility",  3: "Safety",
-    4: "Process",   5: "HR",        6: "IT",
-    7: "Purchase",  8: "Training",  9: "Inventory",
-    10: "Admin"
+    1: "Equipment",
+    2: "Facility",
+    3: "Safety",
+    4: "Process",
+    5: "HR",
+    6: "IT",
+    7: "Purchase",
+    8: "Training",
+    9: "Inventory",
+    10: "Admin",
+}
+
+YES_WORDS = {"yes", "y", "confirm", "ok", "okay"}
+NO_WORDS = {"no", "n", "cancel"}
+RESOURCE_REQUIRED_TYPES = {1, 2, 3, 4}
+LOCATION_RELEVANT_TYPES = {1, 2, 3, 4, 6, 9}
+EDITABLE_FIELDS = {
+    1: "member_id",
+    2: "machine_id",
+    3: "complaint_description",
+    4: "type",
+    5: "status",
+    6: "time_of_complaint",
+    7: "location_name",
+    8: "location_id",
 }
 
 # Types that do NOT require a physical machine / location
@@ -44,19 +44,49 @@ TYPE_NAMES = {
 NON_EQUIPMENT_TYPES = {2, 3, 5, 6, 7, 8, 9, 10}
 
 
-def _resolve_lab_location(db, location_str: str):
-    """
-    Look up lab incharge from lab_incharge table.
-    resources.location stores an integer (locationid).
-    Returns (location_name, location_id, memberid_of_incharge)
-    """
+def _blank_schema() -> dict:
+    return {
+        "member_id": None,
+        "machine_id": None,
+        "complaint_description": None,
+        "type": None,
+        "status": None,
+        "time_of_complaint": None,
+        "location_name": None,
+        "location_id": None,
+        "resource_name": None,
+        "resource_table": None,
+    }
+
+
+def _resource_label(complaint_type: int | None) -> str:
+    return {
+        1: "equipment",
+        2: "facility resource",
+        3: "safety device",
+        4: "tool or equipment",
+    }.get(complaint_type, "resource")
+
+
+def _normalize_location_text(value: str) -> str:
+    text = re.sub(r"[^a-z0-9\s]", " ", str(value).lower())
+    tokens = [
+        token for token in text.split()
+        if token not in {"in", "the", "at", "inside", "near", "lab", "room", "area", "block"}
+    ]
+    return " ".join(tokens).strip()
+
+
+def _resolve_lab_location(db, location_str):
     try:
         if not location_str:
-            return location_str, None, None
+            return None, None, None
 
-        # Try integer match first (resources.location stores locationid as int)
+        raw_location = str(location_str).strip()
+        normalized_location = _normalize_location_text(raw_location)
+
         try:
-            loc_id = int(location_str)
+            loc_id = int(raw_location)
             incharge = db.query(models.LabIncharge).filter(
                 models.LabIncharge.locationid == loc_id
             ).first()
@@ -65,657 +95,392 @@ def _resolve_lab_location(db, location_str: str):
         except ValueError:
             pass
 
-        # Fallback: string match on location name
         incharge = db.query(models.LabIncharge).filter(
-            models.LabIncharge.location.ilike(f"%{location_str}%")
+            models.LabIncharge.location.ilike(f"%{raw_location}%")
         ).first()
         if incharge:
             return incharge.location, incharge.locationid, incharge.memberid
 
-    except Exception as e:
-        print(f"[ENGINE] Lab incharge lookup failed: {e}")
+        if normalized_location:
+            incharge = db.query(models.LabIncharge).filter(
+                models.LabIncharge.location.ilike(f"%{normalized_location}%")
+            ).first()
+            if incharge:
+                return incharge.location, incharge.locationid, incharge.memberid
 
-    return location_str, None, None
+            query_tokens = set(normalized_location.split())
+            best_match = None
+            best_score = 0
+            for row in db.query(models.LabIncharge).all():
+                row_normalized = _normalize_location_text(row.location or "")
+                row_tokens = set(row_normalized.split())
+                if not row_tokens:
+                    continue
+
+                overlap = len(query_tokens.intersection(row_tokens))
+                if overlap > best_score:
+                    best_match = row
+                    best_score = overlap
+
+            if best_match and best_score > 0:
+                return best_match.location, best_match.locationid, best_match.memberid
+    except Exception as exc:
+        print(f"[ENGINE] Lab lookup failed: {exc}")
+
+    cleaned = str(location_str).strip() or None
+    return cleaned, None, None
 
 
-def _log_complaint(db, member_id: int, machine: any, description: str, location_name, location_id, complaint_type: int) -> str:
-    """Log complaint to DB and return confirmation message."""
-    type_name = TYPE_NAMES.get(complaint_type, "Equipment")
-    
-    # Normalize attributes based on class type
-    m_name = getattr(machine, "name", getattr(machine, "device_name", "Unknown Machine"))
-    m_id = getattr(machine, "machid", getattr(machine, "device_id", None))
+def _merge_schema(schema: dict, extracted: dict) -> dict:
+    for key, value in extracted.items():
+        if key in schema and value not in (None, "", "null"):
+            schema[key] = value
+    return schema
 
-    new_complaint = models.Complaint(
-        member_id=member_id,
-        machine_id=m_id,
-        location_name=location_name or str(machine.location),
-        location_id=location_id,
-        complaint_description=description,
-        type=complaint_type,
-        status="Open"
+
+def _resolve_resource_candidates(db, schema: dict, raw_message: str):
+    complaint_type = schema.get("type")
+    query = schema.get("resource_name") or raw_message
+    if complaint_type not in RESOURCE_TABLE_MAP or not query:
+        return []
+    return search_resource_candidates(db, complaint_type, query, schema.get("location_name"))
+
+
+def _apply_matched_resource(db, schema: dict, resource: object) -> dict:
+    config = RESOURCE_TABLE_MAP[schema["type"]]
+    schema["machine_id"] = getattr(resource, config["id_field"])
+    schema["resource_name"] = getattr(resource, config["name_field"])
+    schema["resource_table"] = config["model"].__tablename__
+
+    if not schema.get("location_name"):
+        location_value = getattr(resource, config["location_field"])
+        loc_name, loc_id, _ = _resolve_lab_location(db, location_value)
+        schema["location_name"] = loc_name or str(location_value)
+        schema["location_id"] = loc_id
+
+    return schema
+
+
+def _enrich_schema_from_db(db, schema: dict, raw_message: str):
+    matched_resource = None
+    candidates = _resolve_resource_candidates(db, schema, raw_message)
+
+    if len(candidates) == 1:
+        matched_resource = candidates[0]
+        schema = _apply_matched_resource(db, schema, matched_resource)
+
+    if schema.get("location_name") and not schema.get("location_id"):
+        loc_name, loc_id, _ = _resolve_lab_location(db, schema["location_name"])
+        schema["location_name"] = loc_name or schema["location_name"]
+        schema["location_id"] = loc_id
+
+    return schema, matched_resource, candidates
+
+
+def _next_missing_field(schema: dict) -> str | None:
+    complaint_type = schema.get("type")
+
+    if not schema.get("complaint_description"):
+        return "complaint_description"
+
+    if complaint_type in RESOURCE_REQUIRED_TYPES and not schema.get("machine_id"):
+        return "resource_name"
+
+    if complaint_type in LOCATION_RELEVANT_TYPES and not schema.get("location_name"):
+        return "location_name"
+
+    return None
+
+
+def _question_for_field(field: str, complaint_type: int | None) -> str:
+    type_name = TYPE_NAMES.get(complaint_type, "this")
+
+    if field == "complaint_description":
+        return f"I've classified this as a {type_name.lower()} complaint. What exactly is the issue?"
+    if field == "resource_name":
+        return f"This looks like a {type_name.lower()} complaint. Which {_resource_label(complaint_type)} is affected?"
+    if field == "location_name":
+        return f"Noted. Where is this {type_name.lower()} issue happening?"
+    return f"Please provide {field}."
+
+
+def _format_candidate_options(candidates) -> str:
+    lines = ["I found multiple matching records. Reply with the number:"]
+    for idx, resource in enumerate(candidates, start=1):
+        label = getattr(resource, "name", getattr(resource, "device_name", "Unknown"))
+        location = getattr(resource, "location", "")
+        lines.append(f"{idx}. {label} ({location})")
+    return "\n".join(lines)
+
+
+def _render_schema(schema: dict) -> str:
+    lines = ["{"]
+    for index, field_name in EDITABLE_FIELDS.items():
+        value = schema.get(field_name)
+        rendered = json.dumps(value, default=str)
+        lines.append(f'  "{index}.{field_name}": {rendered},')
+    lines[-1] = lines[-1].rstrip(",")
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def _show_confirmation(schema: dict) -> str:
+    return (
+        f"Please confirm this complaint schema:\n{_render_schema(schema)}\n\n"
+        "Reply 'yes' to register, 'no' to cancel, or send an edit like '1.new_value'."
     )
-    db.add(new_complaint)
+
+
+def _coerce_edited_value(field_name: str, raw_value: str):
+    value = raw_value.strip()
+    if value.lower() in {"null", "none", ""}:
+        return None
+
+    if field_name in {"member_id", "machine_id", "type", "location_id"}:
+        return int(value)
+
+    return value
+
+
+def _apply_schema_edit(db, schema: dict, field_number: int, raw_value: str) -> dict:
+    field_name = EDITABLE_FIELDS[field_number]
+    value = _coerce_edited_value(field_name, raw_value)
+    schema[field_name] = value
+
+    if field_name == "location_name":
+        loc_name, loc_id, _ = _resolve_lab_location(db, value)
+        schema["location_name"] = loc_name or value
+        schema["location_id"] = loc_id
+    elif field_name == "location_id" and value is not None:
+        loc_name, loc_id, _ = _resolve_lab_location(db, value)
+        schema["location_name"] = loc_name or schema.get("location_name")
+        schema["location_id"] = loc_id
+
+    return schema
+
+
+def _parse_edit_message(message: str):
+    match = re.match(r"^\s*(\d+)\.(.+?)\s*$", message, re.DOTALL)
+    if not match:
+        return None, None
+    field_number = int(match.group(1))
+    field_value = match.group(2).strip()
+    if field_number not in EDITABLE_FIELDS:
+        return None, None
+    return field_number, field_value
+
+
+def _register_complaint(db, schema: dict) -> str:
+    schema["status"] = "Open"
+    schema["time_of_complaint"] = datetime.now()
+
+    complaint = models.Complaint(
+        member_id=schema["member_id"],
+        machine_id=schema.get("machine_id"),
+        complaint_description=schema["complaint_description"],
+        type=schema["type"],
+        status=schema["status"],
+        location_name=schema.get("location_name"),
+        location_id=schema.get("location_id"),
+        time_of_complaint=schema["time_of_complaint"],
+    )
+    db.add(complaint)
     db.commit()
 
-    print(f"✅ Complaint logged: {m_name} | Type: {type_name} ({complaint_type}) | Member: {member_id}")
-
     return (
-        f"Got it! I've logged your complaint for *{m_name}* at {location_name or machine.location}. "
-        f"Our team will look into it shortly. 👍\n"
-        f"_(Ref: {type_name} complaint — Status: Open)_"
+        "Complaint registered successfully.\n"
+        f"Type: {TYPE_NAMES.get(schema['type'], 'Unknown')}\n"
+        f"Status: {schema['status']}\n"
+        "❌ -------------------- End of complaint conversation --------------------"
     )
 
-def needs_issue_description(msg: str) -> bool:
-    """Check if the user only provided a machine name without any problem description."""
-    issue_keywords = {
-        "work", "issue", "problem", "broken", "fault", "error", 
-        "fail", "repair", "down", "stop", "noise", "spill", 
-        "leak", "damage", "not", "fix", "refund", "reimbursement", 
-        "payment", "bill"
-    }
-    msg_lower = msg.lower()
-    
-    # If the user explicitly used problem words, they provided a problem
-    if any(kw in msg_lower for kw in issue_keywords):
-        return False
-        
-    # If there are no problem words and the message is short (e.g. just a machine name like "AC" or "Furnace")
-    # Tell them we need the issue described
-    if len(msg.split()) <= 4:
-        return True
-        
-    return False
+
+def _prepare_initial_schema(db, member_id: int, message: str):
+    schema = _blank_schema()
+    schema["member_id"] = member_id
+    schema["type"] = classify_complaint_type(message)
+    schema["status"] = "Open"
+
+    if schema["type"] in RESOURCE_TABLE_MAP:
+        extracted = extract_complaint_schema(message, schema["type"])
+        schema = _merge_schema(schema, extracted)
+
+    if not schema.get("complaint_description"):
+        schema["complaint_description"] = message
+
+    schema, matched_resource, candidates = _enrich_schema_from_db(db, schema, message)
+    schema["type"] = classify_complaint_type(message, matched_machine=matched_resource)
+
+    return schema, candidates
+
+
+def _store_collection_state(db, user_phone: str, schema: dict, current_field: str):
+    upsert_state(db, user_phone, "collecting_info", {"schema": schema, "current_field": current_field})
+
+
+def _store_selection_state(db, user_phone: str, schema: dict, candidates):
+    upsert_state(
+        db,
+        user_phone,
+        "select_resource",
+        {
+            "schema": schema,
+            "candidates": [
+                {
+                    "machine_id": getattr(resource, "machid", getattr(resource, "device_id", None)),
+                    "resource_name": getattr(resource, "name", getattr(resource, "device_name", None)),
+                    "location_name": str(getattr(resource, "location", "")),
+                }
+                for resource in candidates
+            ],
+        },
+    )
+
+
+def _continue_or_confirm(db, user_phone: str, schema: dict, candidates=None) -> str:
+    complaint_type = schema.get("type")
+
+    if candidates and len(candidates) > 1 and complaint_type in RESOURCE_REQUIRED_TYPES and not schema.get("machine_id"):
+        _store_selection_state(db, user_phone, schema, candidates)
+        return _format_candidate_options(candidates)
+
+    next_field = _next_missing_field(schema)
+    if next_field:
+        _store_collection_state(db, user_phone, schema, next_field)
+        return _question_for_field(next_field, complaint_type)
+
+    upsert_state(db, user_phone, "confirming", {"schema": schema})
+    return _show_confirmation(schema)
+
+
+def _handle_resource_selection(db, state, message: str, user_phone: str) -> str:
+    data = parse_collected_data(state)
+    schema = data.get("schema", {})
+    candidates = data.get("candidates", [])
+
+    if not message.strip().isdigit():
+        return "Reply with the number from the list."
+
+    choice = int(message.strip())
+    if choice < 1 or choice > len(candidates):
+        return "That number is not valid. Reply with one of the listed numbers."
+
+    selected = candidates[choice - 1]
+    schema["machine_id"] = selected["machine_id"]
+    schema["resource_name"] = selected["resource_name"]
+
+    if not schema.get("location_name"):
+        loc_name, loc_id, _ = _resolve_lab_location(db, selected.get("location_name"))
+        schema["location_name"] = loc_name or selected.get("location_name")
+        schema["location_id"] = loc_id
+
+    return _continue_or_confirm(db, user_phone, schema)
+
+
+def _handle_collecting_info(db, state, message: str, user_phone: str) -> str:
+    data = parse_collected_data(state)
+    schema = data.get("schema", {})
+    current_field = data.get("current_field")
+    answer = message.strip()
+
+    if not answer:
+        return _question_for_field(current_field, schema.get("type"))
+
+    if current_field == "complaint_description":
+        schema["complaint_description"] = answer
+    elif current_field == "location_name":
+        loc_name, loc_id, _ = _resolve_lab_location(db, answer)
+        schema["location_name"] = loc_name or answer
+        schema["location_id"] = loc_id
+    elif current_field == "resource_name":
+        schema["resource_name"] = answer
+        candidates = _resolve_resource_candidates(db, schema, answer)
+
+        if len(candidates) == 1:
+            schema = _apply_matched_resource(db, schema, candidates[0])
+            return _continue_or_confirm(db, user_phone, schema)
+
+        if len(candidates) > 1:
+            return _continue_or_confirm(db, user_phone, schema, candidates)
+
+    return _continue_or_confirm(db, user_phone, schema)
+
+
+def _handle_confirmation(db, state, message: str, user_phone: str) -> str:
+    data = parse_collected_data(state)
+    schema = data.get("schema", {})
+    msg = message.lower().strip()
+
+    if msg in YES_WORDS:
+        clear_state(db, user_phone)
+        return _register_complaint(db, schema)
+
+    if msg in NO_WORDS:
+        clear_state(db, user_phone)
+        return "Complaint registration canceled."
+
+    field_number, field_value = _parse_edit_message(message)
+    if field_number is not None:
+        try:
+            schema = _apply_schema_edit(db, schema, field_number, field_value)
+        except ValueError:
+            return "That edited value is not valid for the selected field."
+
+        upsert_state(db, user_phone, "confirming", {"schema": schema})
+        return (
+            f"Updated {EDITABLE_FIELDS[field_number]}.\n\n"
+            f"{_show_confirmation(schema)}"
+        )
+
+    return "Reply 'yes' to register the complaint or 'no' to cancel."
+
+
+def _handle_ongoing_conversation(db, state, message: str, user_phone: str) -> str:
+    if state.current_step == "select_resource":
+        return _handle_resource_selection(db, state, message, user_phone)
+
+    if state.current_step == "collecting_info":
+        return _handle_collecting_info(db, state, message, user_phone)
+
+    if state.current_step == "confirming":
+        return _handle_confirmation(db, state, message, user_phone)
+
+    clear_state(db, user_phone)
+    return "I reset the previous conversation state. Please send your complaint again."
 
 
 def get_chatbot_reply(user: dict, message: str) -> str:
-    """
-    Main entry point called from webhook.py after login check.
-    """
     user_phone = user.get("mobile", "unknown")
     member_id = user.get("memberid", 1)
+    msg = message.strip()
+    msg_lower = msg.lower()
 
     db = SessionLocal()
     try:
-        # ── Check for active conversation state ────────────────────
-        state = get_state(db, user_phone)
-        msg_lower_check = message.lower().strip()
-
-        # Global escape word check (Works anytime, whether in state or not)
-        if msg_lower_check in ["cancel", "reset", "stop", "abort"]:
+        if msg_lower in {"cancel", "reset", "stop", "abort"}:
             clear_state(db, user_phone)
-            state = None
-            return "Sure, I've canceled your current action. 🧹 What else can I help you with?"
+            return "Current complaint flow canceled."
 
-        # Global 'undo' rule to delete the LAST registered complaint
-        if msg_lower_check in ["undo", "delete", "remove", "revert"]:
+        if msg_lower in {"undo", "delete", "remove", "revert"}:
             last_complaint = db.query(models.Complaint).filter(
                 models.Complaint.member_id == member_id
             ).order_by(models.Complaint.complaint_id.desc()).first()
-            
-            if last_complaint:
-                db.delete(last_complaint)
-                db.commit()
-                return "I've successfully deleted your last registered complaint. 🗑️ What's next?"
-            else:
-                return "You don't have any recent complaints to delete! 🤔"
+            if not last_complaint:
+                return "No recent complaint was found to delete."
 
-        if state:
-            # ── UNIVERSAL ESCAPE HATCH ──
-            # If user starts a NEW specific complaint while in a menu, clear state.
-            # We check if:
-            # 1. Message contains a known machine name from DB
-            # 2. Message has a very clear category match (Layer 1 scoring)
-            # 3. Message contains "issue" keywords and NOT a menu digit
-            
-            is_digit = message.strip().isdigit()
-            
-            # Categories that are usually "sticky" until answered
-            PRESERVE_STEPS = {"waiting_for_problem"} 
-            
-            new_machines = extract_machine_db(message, db)
-            high_conf_type = keyword_match(message) # Only returns if confident
-            
-            issue_keywords = {"is not", "isnt", "broken", "spill", "leak", "stopped", "fault", "off"}
-            has_issue_words = any(kw in msg_lower_check for kw in issue_keywords)
-
-            # If it's a confident new machine or strong keywords, and user didn't just send a number
-            if (new_machines or high_conf_type or has_issue_words) and not is_digit:
-                if state.current_step not in PRESERVE_STEPS:
-                    clear_state(db, user_phone)
-                    state = None
-                    print(f"[ENGINE] Escape Hatch: Clear state '{state}' for new input: '{message}'")
-
-        # ── STEP: User provided the problem description ──────────────
-        if state and state.current_step == "waiting_for_problem":
-            data = parse_collected_data(state)
-            complaint_desc = message.strip()
-            
-            machine_id = data.get("machine_id")
-            machine_name = data.get("machine_name", "Unknown Equipment")
-            location_name = data.get("location_name", "N/A")
-            location_id = data.get("location_id")
-            complaint_type = data.get("complaint_type", 1)
-            type_name = TYPE_NAMES.get(complaint_type, "Equipment")
-            
-            if machine_id: # known machine
-                m_type = data.get("model_type", "Resources")
-                # Precise re-query based on stored model type
-                if m_type == "SafetyDevice":
-                    machine = db.query(models.SafetyDevice).filter(models.SafetyDevice.device_id == machine_id).first()
-                elif m_type == "EqpProcessResource":
-                    machine = db.query(models.EqpProcessResource).filter(models.EqpProcessResource.machid == machine_id).first()
-                else:
-                    machine = db.query(models.Resources).filter(models.Resources.machid == machine_id).first()
-
-                clear_state(db, user_phone)
-                return _log_complaint(db, member_id, machine, complaint_desc, location_name, location_id, complaint_type)
-            else: # unknown machine or general complaint bypasses _log_complaint
-                new_complaint = models.Complaint(
-                    member_id=member_id,
-                    machine_id=None,
-                    location_name=location_name,
-                    location_id=None,
-                    complaint_description=complaint_desc,
-                    type=complaint_type,
-                    status="Open"
-                )
-                db.add(new_complaint)
-                db.commit()
-                clear_state(db, user_phone)
-                return (
-                    f"Done! I've noted the issue with *{machine_name}*. "
-                    f"Someone will get back to you soon. 👍\n"
-                    f"_(Ref: {type_name} complaint — Status: Open)_"
-                )
-
-        # ── STEP: Classifier returned None → asked user to clarify ────
-        if state and state.current_step == "waiting_for_clarification":
-            data          = parse_collected_data(state)
-            original_msg  = data.get("original_message", "")
-            machine_id    = data.get("machine_id")
-
-            # Try to classify the new rephrased message
-            clarified_type = classify_complaint_type(message)
-
-            if clarified_type is not None:
-                # Great — we now know the type; proceed normally
-                clear_state(db, user_phone)
-                complaint_type = clarified_type
-                type_name = TYPE_NAMES.get(complaint_type, "General")
-                
-                if complaint_type in NON_EQUIPMENT_TYPES:
-                    new_complaint = models.Complaint(
-                        member_id=member_id, machine_id=None,
-                        location_name="N/A", location_id=None,
-                        complaint_description=f"{original_msg} | {message}".strip(" |"),
-                        type=complaint_type, status="Open"
-                    )
-                    db.add(new_complaint)
-                    db.commit()
-                    return (
-                        f"Noted! Your *{type_name}* complaint has been logged. 👍\n"
-                        f"_(Status: Open)_"
-                    )
-
-                if machine_id:
-                    machine = db.query(models.Resources).filter(
-                        models.Resources.machid == machine_id).first()
-                    if machine:
-                        location_name, location_id, _ = _resolve_lab_location(db, str(machine.location))
-                        return _log_complaint(db, member_id, machine, message,
-                                             location_name, location_id, complaint_type)
-
-                # Unknown equipment — fall through to location step
-                machine_name = data.get("machine_name", "Unknown Equipment")
-                upsert_state(db, user_phone, "waiting_for_location", {
-                    "machine_name": machine_name, "complaint_type": complaint_type,
-                    "original_message": message, "member_id": member_id,
-                })
-                return (f"Got it! Which lab or room is *{machine_name}* located in?")
-
-            # Still unclear → escalate to manual menu
-            clear_state(db, user_phone)
-            MANUAL_MENU = (
-                "I'm still not sure what type of complaint this is. "
-                "Please pick a number:\n\n"
-                "1️⃣  Equipment (lab machines)\n"
-                "2️⃣  Facility (AC, power, building)\n"
-                "3️⃣  Safety (fire, spill, hazard)\n"
-                "4️⃣  Process (recipe, yield)\n"
-                "5️⃣  HR (salary, leave, payroll)\n"
-                "6️⃣  IT (laptop, wifi, software)\n"
-                "7️⃣  Purchase (order, vendor, spares)\n"
-                "8️⃣  Training (workshop, course, seminar)\n"
-                "9️⃣  Inventory (stock, missing items, spares)\n"
-                "🔟  Admin (documents, policy, access)"
-            )
-            upsert_state(db, user_phone, "waiting_for_type_selection", {
-                "original_message": original_msg or message,
-                "machine_id":       machine_id,
-                "machine_name":     data.get("machine_name", "Unknown Equipment"),
-            })
-            return MANUAL_MENU
-
-        # ── STEP: Manual type-number selection menu ───────────────────
-        if state and state.current_step == "waiting_for_type_selection":
-            data           = parse_collected_data(state)
-            original_msg   = data.get("original_message", message)
-            machine_id     = data.get("machine_id")
-            machine_name   = data.get("machine_name", "Unknown Equipment")
-            ALLOWED_INPUTS = {"1":1, "2":2, "3":3, "4":4, "5":5,
-                              "6":6, "7":7, "8":8, "9":9, "10":10}
-
-            selection = message.strip()
-            if selection in ALLOWED_INPUTS:
-                complaint_type = ALLOWED_INPUTS[selection]
-                type_name      = TYPE_NAMES.get(complaint_type, "General")
-                if complaint_type in NON_EQUIPMENT_TYPES:
-                    new_complaint = models.Complaint(
-                        member_id=member_id, machine_id=None,
-                        location_name="N/A", location_id=None,
-                        complaint_description=original_msg,
-                        type=complaint_type, status="Open"
-                    )
-                    db.add(new_complaint)
-                    db.commit()
-                    return (
-                        f"Done! Your *{type_name}* complaint has been logged. 👍\n"
-                        f"_(Status: Open)_"
-                    )
-
-                if machine_id:
-                    machine = db.query(models.Resources).filter(
-                        models.Resources.machid == machine_id).first()
-                    if machine:
-                        location_name, location_id, _ = _resolve_lab_location(db, str(machine.location))
-                        return _log_complaint(db, member_id, machine, original_msg,
-                                             location_name, location_id, complaint_type)
-
-                # Unknown equipment path
-                upsert_state(db, user_phone, "waiting_for_location", {
-                    "machine_name": machine_name, "complaint_type": complaint_type,
-                    "original_message": original_msg, "member_id": member_id,
-                })
-                return (f"Got it! Which lab or room is *{machine_name}* located in?")
-
-            # Invalid menu input
-            return (
-                "Please reply with just the number from the list:\n"
-                "1 Equipment · 2 Facility · 3 Safety · 4 Process\n"
-                "5 HR · 6 IT · 7 Purchase · 8 Training · 9 Inventory · 10 Admin"
-            )
-
-        # ── STEP: User selecting from numbered list ─────────────────
-        if state and state.current_step == "waiting_for_selection":
-            data = parse_collected_data(state)
-            machines_data = data.get("machines", [])
-            original_msg = data.get("original_message", message)
-
-            # Try to parse user's selection number
-            selection = message.strip()
-            if selection.isdigit():
-                idx = int(selection) - 1
-                if 0 <= idx < len(machines_data):
-                    machine_info = machines_data[idx]
-
-                    # Re-query the actual machine object from the SPECIFIC table (prevents ID collisions)
-                    m_type = machine_info.get("model_type", "Resources")
-                    mid = machine_info["machid"]
-                    
-                    if m_type == "SafetyDevice":
-                        machine = db.query(models.SafetyDevice).filter(models.SafetyDevice.device_id == mid).first()
-                    elif m_type == "EqpProcessResource":
-                        machine = db.query(models.EqpProcessResource).filter(models.EqpProcessResource.machid == mid).first()
-                    else:
-                        machine = db.query(models.Resources).filter(models.Resources.machid == mid).first()
-
-                    if machine:
-                        clear_state(db, user_phone)
-                        location_name, location_id, _ = _resolve_lab_location(db, str(machine.location))
-                        complaint_type = classify_complaint_type(original_msg, machine)
-                        
-                        if needs_issue_description(original_msg):
-                            upsert_state(db, user_phone, "waiting_for_problem", {
-                                "machine_id": getattr(machine, 'machid', getattr(machine, 'device_id', None)),
-                                "model_type": type(machine).__name__,
-                                "machine_name": getattr(machine, 'name', getattr(machine, 'device_name', '')),
-                                "location_name": location_name,
-                                "location_id": location_id,
-                                "complaint_type": complaint_type
-                            })
-                            return f"Got it, you picked *{machine.name}*. What exact issue are you facing with it?"
-
-                        return _log_complaint(db, member_id, machine, original_msg, location_name, location_id, complaint_type)
-
-                elif idx == len(machines_data):
-                    # Use the full intelligent pipeline (DB -> Key -> Gemini)
-                    complaint_type = classify_complaint_type(original_msg) or 1
-                    
-                    # ── Logic Shift: If it's a non-equipment type, don't ask for a machine/location ──
-                    if complaint_type in NON_EQUIPMENT_TYPES:
-                        type_name_friendly = TYPE_NAMES.get(complaint_type, "General")
-                        
-                        # Always ask for details instead of logging directly
-                        upsert_state(db, user_phone, "waiting_for_problem", {
-                            "machine_id":    None,
-                            "machine_name":  "General Request",
-                            "location_name": "N/A",
-                            "location_id":   None,
-                            "complaint_type": complaint_type
-                        })
-                        return f"Got it, this sounds like a *{type_name_friendly}* request. Could you give me a bit more detail about the issue?"
-
-                    # ── Conversational Extraction ──────────────────────
-                    # Instead of "Unknown Equipment", get a smart name (e.g., "Lighting", "AC")
-                    machine_name = extract_unknown_smart(original_msg)
-                    
-                    upsert_state(db, user_phone, "waiting_for_location", {
-                        "machine_name": machine_name,
-                        "complaint_type": complaint_type,
-                        "original_message": original_msg,
-                        "member_id": member_id,
-                    })
-                    
-                    if machine_name in ["this issue", "item"]:
-                        return "Got it! Which lab or room are you talking about?"
-                    return f"Okay! Which lab or room is the *{machine_name}* located in?"
-
-            # Invalid selection
-            options = "\n".join(
-                [f"{i+1}. {m['name']} — {m['location']}"
-                 for i, m in enumerate(machines_data)]
-            )
-            options += f"\n{len(machines_data) + 1}. Other (Not listed)"
-            return (
-                f"Hmm, just send the number next to the machine you mean 😊\n\n"
-                f"{options}"
-            )
-
-        # ── STEP: User narrowed by location ────────────────────────
-        if state and state.current_step == "waiting_for_narrowing":
-            data = parse_collected_data(state)
-            all_machines = data.get("machines", [])
-            unique_locs = data.get("unique_locs", [])
-            original_msg = data.get("original_message", message)
-            
-            user_input = message.strip().lower()
-            location_filter = None
-
-            # Check if user replied with a digit index
-            if user_input.isdigit():
-                idx = int(user_input) - 1
-                if 0 <= idx < len(unique_locs):
-                    location_filter = unique_locs[idx].lower()
-                elif idx == len(unique_locs):
-                    # Use the full intelligent pipeline (DB -> Key -> Gemini)
-                    complaint_type = classify_complaint_type(original_msg) or 1
-                    
-                    if complaint_type in NON_EQUIPMENT_TYPES:
-                        type_name_friendly = TYPE_NAMES.get(complaint_type, "General")
-                        
-                        # Always ask for details instead of logging directly
-                        upsert_state(db, user_phone, "waiting_for_problem", {
-                            "machine_id":    None,
-                            "machine_name":  "General Request",
-                            "location_name": "N/A",
-                            "location_id":   None,
-                            "complaint_type": complaint_type
-                        })
-                        return f"I understand this is a *{type_name_friendly}* request. What exactly is the issue or details?"
-
-                    # Otherwise, proceed to unknown location flow
-                    result = extract_unknown_equipment(original_msg)
-                    machine_name = result["machine_name"]
-                    upsert_state(db, user_phone, "waiting_for_location", {
-                        "machine_name": machine_name,
-                        "complaint_type": complaint_type,
-                        "original_message": original_msg,
-                        "member_id": member_id,
-                    })
-                    return f"Okay! Which lab or room is *{machine_name}* located in?"
-            
-            # If not a digit, fall back to loose string matching
-            if not location_filter:
-                location_filter = user_input
-
-            # Filter stored candidates by location, name, or category string
-            narrowed = [
-                m for m in all_machines
-                if location_filter in (str(m.get("location") or "")).lower() or
-                   location_filter in (str(m.get("name") or "")).lower() or
-                   location_filter in (str(m.get("category") or "")).lower()
-            ]
-
-            if not narrowed:
-                # Location not recognized — tell user and re-show valid options
-                locs_text = "\n".join(f"{i+1}. {loc}" for i, loc in enumerate(unique_locs))
-                locs_text += f"\n{len(unique_locs) + 1}. Other (Not listed)"
-                return (
-                    f"I couldn't find *'{message.strip()}'* in our lab list. Could you try sending one of these numbers?\n\n"
-                    f"{locs_text}"
-                )
-
-            # Always display the list of narrowed items now, regardless of how many there are.
-            upsert_state(db, user_phone, "waiting_for_selection", {
-                "machines": narrowed,
-                "original_message": original_msg,
-                "member_id": member_id,
-            })
-            options = "\n".join(
-                [f"{i+1}. {m['name']} — {m['location']}"
-                 for i, m in enumerate(narrowed)]
-            )
-            options += f"\n{len(narrowed) + 1}. Other (Not listed)"
-            return f"Here's what I found in that area. Which one is it?\n\n{options}"
-
-        # ── STEP: User provided location for unknown equipment ─────
-
-        if state and state.current_step == "waiting_for_location":
-            data = parse_collected_data(state)
-
-            # Use this message as the location answer
-            location_str = message.strip()
-            complaint_type = data.get("complaint_type", 1)
-            machine_name = data.get("machine_name", "Unknown Equipment")
-            type_name = TYPE_NAMES.get(complaint_type, "Equipment")
-            original_msg = data.get("original_message", "")
-
-            if needs_issue_description(original_msg):
-                upsert_state(db, user_phone, "waiting_for_problem", {
-                    "machine_id": data.get("machine_id"),
-                    "machine_name": machine_name,
-                    "location_name": location_str,
-                    "location_id": data.get("location_id"),
-                    "complaint_type": complaint_type
-                })
-                return f"Got it, location is {location_str}. What exact issue are you facing with *{machine_name}*?"
-
-            new_complaint = models.Complaint(
-                member_id=member_id,
-                machine_id=None,
-                location_name=location_str,
-                location_id=None,
-                complaint_description=data.get("original_message", ""),
-                type=complaint_type,
-                status="Open"
-            )
-            db.add(new_complaint)
+            db.delete(last_complaint)
             db.commit()
-            clear_state(db, user_phone)
+            return "Your latest complaint has been deleted."
 
-            print(f"✅ Unknown equipment complaint: {machine_name} | Location: {location_str}")
-            return (
-                f"Done! I've noted the issue with *{machine_name}* at {location_str}. "
-                f"Someone will get back to you soon. 👍\n"
-                f"_(Ref: {type_name} complaint — Status: Open)_"
-            )
+        state = get_state(db, user_phone)
+        if state:
+            return _handle_ongoing_conversation(db, state, msg, user_phone)
 
-        # ── Match machine from ACTIVE resources ────────────────────
-
-        matched = extract_machine_db(message, db)
-
-        # ── No machine found → classify & route by complaint type ───
-        if not matched:
-            # First, classify the complaint without heavy extraction
-            complaint_type = classify_complaint_type(message)   # may return None
-
-            # ── Classifier failed → ask user to clarify (once) ────────
-            if complaint_type is None:
-                upsert_state(db, user_phone, "waiting_for_clarification", {
-                    "original_message": message,
-                    "machine_name":     "Unknown Equipment",
-                    "machine_id":       None,
-                })
-                return (
-                    "🤔 I'm not sure what kind of issue that is. "
-                    "Could you describe the problem in a bit more detail? "
-
-                )
-
-            if complaint_type in NON_EQUIPMENT_TYPES:
-                type_name_friendly = TYPE_NAMES.get(complaint_type, "General")
-                if needs_issue_description(message):
-                    upsert_state(db, user_phone, "waiting_for_problem", {
-                        "machine_id":    None,
-                        "machine_name":  "General Request",
-                        "location_name": "N/A",
-                        "location_id":   None,
-                        "complaint_type": complaint_type
-                    })
-                    return (
-                        f"You want to log a *{type_name_friendly}* request. "
-                        f"What exactly is the issue or details?"
-                    )
-
-                new_complaint = models.Complaint(
-                    member_id=member_id, machine_id=None,
-                    location_name="N/A", location_id=None,
-                    complaint_description=message,
-                    type=complaint_type, status="Open"
-                )
-                db.add(new_complaint)
-                db.commit()
-                print(f"✅ Non-equipment complaint logged | Type: {type_name_friendly}")
-                return (
-                    f"Noted! Your *{type_name_friendly}* complaint has been logged. 👍\n"
-                    f"_(Status: Open)_"
-                )
-
-            # Equipment / Facility / Process → need a physical location
-            extracted = extract_unknown_equipment(message)
-            machine_name = extracted["machine_name"]
-            
-            upsert_state(db, user_phone, "waiting_for_location", {
-                "machine_name":   machine_name,
-                "complaint_type": complaint_type,
-                "original_message": message,
-                "member_id":      member_id,
-            })
-            return (
-                f"Hmm, I don't recognize *{machine_name}* in my database yet. "
-                f"Is it located in a specific lab or room? Just tell me where it is, and I'll log it for you."
-            )
-
-
-        # ── Single match → log directly ────────────────────────────
-        if len(matched) == 1:
-            machine = matched[0]
-            location_name, location_id, _ = _resolve_lab_location(db, str(machine.location))
-            m_name = getattr(machine, "name", getattr(machine, "device_name", "Unknown Machine"))
-
-            # If location is missing/unresolvable → ask user
-            if not location_name or location_name.strip() in ["", "None", "0", "none"]:
-                complaint_type = classify_complaint_type(message, machine)
-                upsert_state(db, user_phone, "waiting_for_location", {
-                    "machine_name": m_name,
-                    "machine_id": getattr(machine, "machid", getattr(machine, "device_id", None)),
-                    "complaint_type": complaint_type,
-                    "original_message": message,
-                    "member_id": member_id,
-                })
-                return (
-                    f"I found *{m_name}* but its location isn't set in our system yet. "
-                    f"Which lab or room is it in?"
-                )
-
-            complaint_type = classify_complaint_type(message, machine) or 1  # default Equipment if unclear
-
-            if needs_issue_description(message):
-                upsert_state(db, user_phone, "waiting_for_problem", {
-                    "machine_id":    getattr(machine, "machid", getattr(machine, "device_id", None)),
-                    "model_type":    type(machine).__name__,
-                    "machine_name":  m_name,
-                    "location_name": location_name,
-                    "location_id":   location_id,
-                    "complaint_type": complaint_type
-                })
-                return f"Got it, you mean *{m_name}*. What exact issue are you facing with it?"
-
-            return _log_complaint(db, member_id, machine, message, location_name, location_id, complaint_type)
-
-        # ── Multiple matches → bulk-load locations, then decide ────
-        # Batch load ALL lab locations in one query (avoids N+1 per machine)
-        all_incharge = db.query(models.LabIncharge).all()
-        loc_map = {row.locationid: row.location for row in all_incharge}
-
-        def resolve_loc(loc_val):
-            try:
-                lid = int(str(loc_val))
-                return loc_map.get(lid) or str(loc_val)
-            except (ValueError, TypeError):
-                return str(loc_val)
-
-        # Build machine data using the pre-loaded map
-        machines_data = []
-        for m in matched:
-            machines_data.append({
-                "machid": getattr(m, "machid", getattr(m, "device_id", None)),
-                "model_type": type(m).__name__,
-                "name": getattr(m, "name", getattr(m, "device_name", "Unknown Machine")),
-                "location": resolve_loc(m.location),
-                "category": m.category
-            })
-
-        # If too many matches → ask for location to narrow down FIRST
-        if len(machines_data) > 20:
-            unique_locs = sorted(list(set(m["location"] for m in machines_data if m.get("location"))))
-            upsert_state(db, user_phone, "waiting_for_narrowing", {
-                "machines": machines_data,
-                "unique_locs": unique_locs,
-                "original_message": message,
-                "member_id": member_id,
-            })
-            locs_text = "\n".join(f"{i+1}. {loc}" for i, loc in enumerate(unique_locs))
-            locs_text += f"\n{len(unique_locs) + 1}. Other (Not listed)"
-            return (
-                f"I found {len(matched)} machines with that name across different labs. "
-                f"Please reply with the number for your lab:\n\n{locs_text}"
-            )
-
-        # 20 or fewer → show numbered list
-        upsert_state(db, user_phone, "waiting_for_selection", {
-            "machines": machines_data,
-            "original_message": message,
-            "member_id": member_id,
-        })
-        options = "\n".join(
-            [f"{i+1}. {m['name']} — {m['location']}"
-             for i, m in enumerate(machines_data)]
-        )
-        options += f"\n{len(machines_data) + 1}. Other (Not listed)"
-        return (
-            f"I found a few matches. Which one are you referring to?\n\n"
-            f"{options}"
-        )
-
-
-
-
-    except Exception as e:
-        print(f"[CHATBOT ENGINE ERROR] {e}")
+        schema, candidates = _prepare_initial_schema(db, member_id, msg)
+        return _continue_or_confirm(db, user_phone, schema, candidates)
+    except Exception as exc:
+        print(f"[ENGINE] Error: {exc}")
         traceback.print_exc()
-        return "Sorry, something went wrong on my end. Could you try again?"
-
+        return "Sorry, something went wrong. Please try again."
     finally:
         db.close()

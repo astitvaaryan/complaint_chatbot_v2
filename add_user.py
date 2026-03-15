@@ -3,9 +3,9 @@ from app.database import get_connection
 
 def add_user():
     mobile = "9894254006"
-    fname = "Bala"
+    fname = "Bala Krishnan"
     lname = "Unknown"
-    email = "bala@example.com"
+    email = "bala1@example.com"
     position = "Researcher"
     is_admin = 0
     password = "dummy_password"
@@ -33,7 +33,7 @@ def add_user():
     try:
         with conn.cursor() as cursor:
             # Check if user already exists
-            cursor.execute("SELECT memberid FROM login WHERE mobile = %s", (mobile,))
+            cursor.execute("SELECT memberid FROM login WHERE email = %s", (email,))
             if cursor.fetchone():
                 print("User already exists!")
                 return
