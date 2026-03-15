@@ -7,7 +7,8 @@ from app.chatbot import models
 
 STOP_WORDS = {
     "has", "have", "not", "the", "and", "for", "with", "this", "that",
-    "issue", "problem", "working", "broken", "fault", "repair", "fix",
+    "issue", "problem", "working", "workng", "workin", "works", "worked",
+    "broken", "fault", "repair", "fix", "fail", "failed", "failure",
     "since", "down", "off", "from", "there", "its", "our", "please",
     "help", "check", "seems", "started", "stopped", "suddenly", "always",
     "complaint", "device", "equipment", "machine", "resource", "safety",
@@ -74,8 +75,10 @@ def _match_candidates(query_text: str, rows: Iterable[object], name_getter) -> L
             continue
 
         name_tokens = _tokenize(name_norm)
+        cat_tokens  = _tokenize(cat_norm)
         meaningful_msg_tokens = msg_tokens - STOP_WORDS
-        overlap = name_tokens.intersection(meaningful_msg_tokens)
+        
+        overlap = (name_tokens | cat_tokens).intersection(meaningful_msg_tokens)
         required = 1 if len(meaningful_msg_tokens) <= 1 else 2
         if len(overlap) >= required:
             partial_matches.append(row)

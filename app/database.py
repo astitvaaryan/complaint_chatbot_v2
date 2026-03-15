@@ -22,30 +22,37 @@ def get_connection():
     return pymysql.connect(**DB_CONFIG)
 
 
-def get_user_by_mobile(mobile_number: str):
+def _clean_mobile(mobile_number: str) -> str:
     """
-    Lookup user in the login table by mobile number.
-    Handles both '9764670987' and '+919764670987' formats.
-    Returns a dict with user info, or None if not found.
+    Normalise a raw number like 'whatsapp:+919764670987' → '9764670987'.
+    Shared by all lookup functions.
     """
-    clean_number = mobile_number.strip()
+    number = mobile_number.strip()
 
-    # Remove whatsapp: prefix
-    if clean_number.startswith("whatsapp:"):
-        clean_number = clean_number[len("whatsapp:"):]
+    if number.startswith("whatsapp:"):
+        number = number[len("whatsapp:"):]
+    if number.startswith("+91"):
+        number = number[3:]
+    elif number.startswith("+"):
+        number = number[1:]
 
-    # Remove country code
-    if clean_number.startswith("+91"):
-        clean_number = clean_number[3:]
-    elif clean_number.startswith("+"):
-        clean_number = clean_number[1:]
+    number = number.replace(" ", "").replace("-", "")
 
-    # Remove spaces/dashes
-    clean_number = clean_number.replace(" ", "").replace("-", "")
+    if len(number) > 10:
+        number = number[-10:]
 
-    # Take last 10 digits as safety net
-    if len(clean_number) > 10:
-        clean_number = clean_number[-10:]
+    return number
+
+
+def get_users_by_mobile(mobile_number: str) -> list:
+    """
+    Return ALL login rows that share this mobile number.
+
+    - Returns []          → number not registered at all
+    - Returns [one_user]  → unique match, no email needed
+    - Returns [u1, u2, …] → duplicate numbers, email verification required
+    """
+    clean_number = _clean_mobile(mobile_number)
 
     conn = None
     try:
@@ -54,14 +61,46 @@ def get_user_by_mobile(mobile_number: str):
             cursor.execute(
                 "SELECT memberid, email, fname, lname, position, is_admin, "
                 "mobile, expiry_date, department "
-                "FROM login WHERE mobile = %s LIMIT 1",
+                "FROM login WHERE mobile = %s",
                 (clean_number,)
+            )
+            users = cursor.fetchall()
+        return users or []
+
+    except Exception as e:
+        print(f"[DB ERROR] get_users_by_mobile: {e}")
+        return []
+
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_user_by_mobile_and_email(mobile_number: str, email: str):
+    """
+    When multiple accounts share a mobile number, resolve the correct user
+    by checking the email they provided.
+
+    Returns the matching user dict, or None if no match.
+    """
+    clean_number = _clean_mobile(mobile_number)
+    clean_email  = email.strip().lower()
+
+    conn = None
+    try:
+        conn = get_connection()
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT memberid, email, fname, lname, position, is_admin, "
+                "mobile, expiry_date, department "
+                "FROM login WHERE mobile = %s AND LOWER(email) = %s LIMIT 1",
+                (clean_number, clean_email)
             )
             user = cursor.fetchone()
         return user
 
     except Exception as e:
-        print(f"[DB ERROR] {e}")
+        print(f"[DB ERROR] get_user_by_mobile_and_email: {e}")
         return None
 
     finally:

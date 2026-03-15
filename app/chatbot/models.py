@@ -13,7 +13,7 @@ class Resources(Base):
     machid = Column(Integer, primary_key=True, index=True)
     name = Column(String(150))
     location = Column(String(250))
-    activation_status = Column(Integer)
+    isworking = Column(Integer, default=1)
     category = Column(String(50))
 
 
@@ -70,3 +70,12 @@ class ConversationState(Base):
     user_phone = Column(String(40), unique=True, index=True, nullable=False)
     current_step = Column(String(100), nullable=False)
     collected_data = Column(Text, nullable=False)
+
+
+class ComplaintKeyword(Base):
+    """Keywords extracted from CSV datasets to improve classification accuracy."""
+    __tablename__ = "complaint_it_keywords"
+
+    id = Column(Integer, primary_key=True, index=True)
+    keyword = Column(String(100), unique=True, index=True, nullable=False)
+    type = Column(Integer, nullable=False) # 1=Equipment ... 10=Admin

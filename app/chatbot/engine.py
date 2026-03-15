@@ -39,6 +39,10 @@ EDITABLE_FIELDS = {
     8: "location_id",
 }
 
+# Types that do NOT require a physical machine / location
+# 2=Facility, 3=Safety, 5=HR, 6=IT, etc.
+NON_EQUIPMENT_TYPES = {2, 3, 5, 6, 7, 8, 9, 10}
+
 
 def _blank_schema() -> dict:
     return {
