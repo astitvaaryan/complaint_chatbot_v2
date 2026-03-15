@@ -1,6 +1,7 @@
 """Schema-driven complaint engine with typed resource-table lookups."""
 
 import json
+import re
 import traceback
 from datetime import datetime
 
@@ -27,6 +28,16 @@ YES_WORDS = {"yes", "y", "confirm", "ok", "okay"}
 NO_WORDS = {"no", "n", "cancel"}
 RESOURCE_REQUIRED_TYPES = {1, 2, 3, 4}
 LOCATION_RELEVANT_TYPES = {1, 2, 3, 4, 6, 9}
+EDITABLE_FIELDS = {
+    1: "member_id",
+    2: "machine_id",
+    3: "complaint_description",
+    4: "type",
+    5: "status",
+    6: "time_of_complaint",
+    7: "location_name",
+    8: "location_id",
+}
 
 
 def _blank_schema() -> dict:
@@ -53,13 +64,25 @@ def _resource_label(complaint_type: int | None) -> str:
     }.get(complaint_type, "resource")
 
 
+def _normalize_location_text(value: str) -> str:
+    text = re.sub(r"[^a-z0-9\s]", " ", str(value).lower())
+    tokens = [
+        token for token in text.split()
+        if token not in {"in", "the", "at", "inside", "near", "lab", "room", "area", "block"}
+    ]
+    return " ".join(tokens).strip()
+
+
 def _resolve_lab_location(db, location_str):
     try:
         if not location_str:
             return None, None, None
 
+        raw_location = str(location_str).strip()
+        normalized_location = _normalize_location_text(raw_location)
+
         try:
-            loc_id = int(str(location_str).strip())
+            loc_id = int(raw_location)
             incharge = db.query(models.LabIncharge).filter(
                 models.LabIncharge.locationid == loc_id
             ).first()
@@ -69,10 +92,34 @@ def _resolve_lab_location(db, location_str):
             pass
 
         incharge = db.query(models.LabIncharge).filter(
-            models.LabIncharge.location.ilike(f"%{str(location_str).strip()}%")
+            models.LabIncharge.location.ilike(f"%{raw_location}%")
         ).first()
         if incharge:
             return incharge.location, incharge.locationid, incharge.memberid
+
+        if normalized_location:
+            incharge = db.query(models.LabIncharge).filter(
+                models.LabIncharge.location.ilike(f"%{normalized_location}%")
+            ).first()
+            if incharge:
+                return incharge.location, incharge.locationid, incharge.memberid
+
+            query_tokens = set(normalized_location.split())
+            best_match = None
+            best_score = 0
+            for row in db.query(models.LabIncharge).all():
+                row_normalized = _normalize_location_text(row.location or "")
+                row_tokens = set(row_normalized.split())
+                if not row_tokens:
+                    continue
+
+                overlap = len(query_tokens.intersection(row_tokens))
+                if overlap > best_score:
+                    best_match = row
+                    best_score = overlap
+
+            if best_match and best_score > 0:
+                return best_match.location, best_match.locationid, best_match.memberid
     except Exception as exc:
         print(f"[ENGINE] Lab lookup failed: {exc}")
 
@@ -163,24 +210,60 @@ def _format_candidate_options(candidates) -> str:
 
 
 def _render_schema(schema: dict) -> str:
-    payload = {
-        "member_id": schema.get("member_id"),
-        "machine_id": schema.get("machine_id"),
-        "complaint_description": schema.get("complaint_description"),
-        "type": schema.get("type"),
-        "status": schema.get("status"),
-        "time_of_complaint": schema.get("time_of_complaint"),
-        "location_name": schema.get("location_name"),
-        "location_id": schema.get("location_id"),
-    }
-    return json.dumps(payload, indent=2, default=str)
+    lines = ["{"]
+    for index, field_name in EDITABLE_FIELDS.items():
+        value = schema.get(field_name)
+        rendered = json.dumps(value, default=str)
+        lines.append(f'  "{index}.{field_name}": {rendered},')
+    lines[-1] = lines[-1].rstrip(",")
+    lines.append("}")
+    return "\n".join(lines)
 
 
 def _show_confirmation(schema: dict) -> str:
     return (
         f"Please confirm this complaint schema:\n{_render_schema(schema)}\n\n"
-        "Reply 'yes' to register or 'no' to cancel."
+        "Reply 'yes' to register, 'no' to cancel, or send an edit like '1.new_value'."
     )
+
+
+def _coerce_edited_value(field_name: str, raw_value: str):
+    value = raw_value.strip()
+    if value.lower() in {"null", "none", ""}:
+        return None
+
+    if field_name in {"member_id", "machine_id", "type", "location_id"}:
+        return int(value)
+
+    return value
+
+
+def _apply_schema_edit(db, schema: dict, field_number: int, raw_value: str) -> dict:
+    field_name = EDITABLE_FIELDS[field_number]
+    value = _coerce_edited_value(field_name, raw_value)
+    schema[field_name] = value
+
+    if field_name == "location_name":
+        loc_name, loc_id, _ = _resolve_lab_location(db, value)
+        schema["location_name"] = loc_name or value
+        schema["location_id"] = loc_id
+    elif field_name == "location_id" and value is not None:
+        loc_name, loc_id, _ = _resolve_lab_location(db, value)
+        schema["location_name"] = loc_name or schema.get("location_name")
+        schema["location_id"] = loc_id
+
+    return schema
+
+
+def _parse_edit_message(message: str):
+    match = re.match(r"^\s*(\d+)\.(.+?)\s*$", message, re.DOTALL)
+    if not match:
+        return None, None
+    field_number = int(match.group(1))
+    field_value = match.group(2).strip()
+    if field_number not in EDITABLE_FIELDS:
+        return None, None
+    return field_number, field_value
 
 
 def _register_complaint(db, schema: dict) -> str:
@@ -203,7 +286,8 @@ def _register_complaint(db, schema: dict) -> str:
     return (
         "Complaint registered successfully.\n"
         f"Type: {TYPE_NAMES.get(schema['type'], 'Unknown')}\n"
-        f"Status: {schema['status']}"
+        f"Status: {schema['status']}\n"
+        "❌ -------------------- End of complaint conversation --------------------"
     )
 
 
@@ -330,6 +414,19 @@ def _handle_confirmation(db, state, message: str, user_phone: str) -> str:
     if msg in NO_WORDS:
         clear_state(db, user_phone)
         return "Complaint registration canceled."
+
+    field_number, field_value = _parse_edit_message(message)
+    if field_number is not None:
+        try:
+            schema = _apply_schema_edit(db, schema, field_number, field_value)
+        except ValueError:
+            return "That edited value is not valid for the selected field."
+
+        upsert_state(db, user_phone, "confirming", {"schema": schema})
+        return (
+            f"Updated {EDITABLE_FIELDS[field_number]}.\n\n"
+            f"{_show_confirmation(schema)}"
+        )
 
     return "Reply 'yes' to register the complaint or 'no' to cancel."
 
