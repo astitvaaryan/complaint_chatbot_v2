@@ -19,6 +19,7 @@ Kaggle dataset (optional, enriches keyword set):
   Place the CSV as:  data/customer_support_tickets.csv
 """
 
+import json
 import os
 import re
 import json

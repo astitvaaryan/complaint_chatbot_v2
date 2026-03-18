@@ -1,5 +1,7 @@
 import traceback
-from fastapi import APIRouter, Request, Form
+from datetime import datetime
+
+from fastapi import APIRouter, Form, Request
 from fastapi.responses import Response
 from twilio.twiml.messaging_response import MessagingResponse
 from app.database import (
@@ -17,12 +19,13 @@ from app.chatbot.engine import get_chatbot_reply   # top-level: crash on startup
 
 router = APIRouter()
 
+
 def twiml_response(resp: MessagingResponse) -> Response:
     """Return a properly formatted TwiML HTTP response for Twilio."""
     return Response(
         content=str(resp),
         media_type="text/xml",
-        headers={"Content-Type": "text/xml; charset=utf-8"}
+        headers={"Content-Type": "text/xml; charset=utf-8"},
     )
 
 # Sessions and pending verifications are now handled via database persistence (app/database.py)
@@ -32,13 +35,11 @@ MAX_EMAIL_ATTEMPTS = 3   # lock out after this many wrong emails
 
 
 def normalize_number(from_field: str) -> str:
-    """
-    Convert Twilio's 'whatsapp:+919764670987' → '9764670987'
-    """
+    """Convert Twilio sender values to a normalized 10-digit number."""
     number = from_field.strip()
 
     if number.startswith("whatsapp:"):
-        number = number[len("whatsapp:"):]
+        number = number[len("whatsapp:") :]
     if number.startswith("+91"):
         number = number[3:]
     elif number.startswith("+"):
@@ -64,12 +65,9 @@ def is_account_expired(expiry_date_str: str) -> bool:
 
 
 def handle_message(user: dict, message: str) -> str:
-    """
-    Route authenticated user messages to the chatbot engine.
-    """
+    """Route authenticated user messages to the chatbot engine."""
     msg_lower = message.lower().strip()
 
-    # ── Basic commands handled locally ────────────────────────────
     if msg_lower in ["hi", "hello", "hey"]:
         return (
             f"Hello, {user['fname']}! 👋\n"
@@ -78,19 +76,18 @@ def handle_message(user: dict, message: str) -> str:
 
     if msg_lower == "whoami":
         return (
-            f"👤 *Your Info*\n\n"
+            f"Your Info\n\n"
             f"Name: {user['fname']} {user['lname']}\n"
             f"Role: {user['position']}\n"
             f"Email: {user['email']}"
         )
 
-    # ── All other messages → chatbot engine ───────────────────────
     try:
         return get_chatbot_reply(user, message)
-    except Exception as e:
-        print(f"[WEBHOOK] Unhandled engine error: {e}")
+    except Exception as exc:
+        print(f"[WEBHOOK] Unhandled engine error: {exc}")
         traceback.print_exc()
-        return "⚠️ Something went wrong. Please try again."
+        return "Something went wrong. Please try again."
 
 
 def _admit_user(mobile: str, user: dict, incoming_msg: str) -> str:
@@ -133,7 +130,7 @@ async def whatsapp_webhook(
     sender_raw   = From.strip()
     mobile       = normalize_number(sender_raw)
 
-    print(f"📩 [{mobile}]: {incoming_msg}")
+    print(f"[{mobile}]: {incoming_msg}")
 
     resp = MessagingResponse()
 
