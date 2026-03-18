@@ -6,7 +6,11 @@ import traceback
 from datetime import datetime
 
 from app.chatbot import models
-from app.chatbot.classifier import classify_complaint_type, extract_complaint_schema
+from app.chatbot.classifier import (
+    classify_complaint_type,
+    extract_complaint_schema,
+    extract_local_complaint_schema,
+)
 from app.chatbot.db import SessionLocal
 from app.chatbot.extractor import RESOURCE_TABLE_MAP, search_resource_candidates
 from app.chatbot.state_manager import clear_state, get_state, parse_collected_data, upsert_state
@@ -27,7 +31,7 @@ TYPE_NAMES = {
 YES_WORDS = {"yes", "y", "confirm", "ok", "okay"}
 NO_WORDS = {"no", "n", "cancel"}
 RESOURCE_REQUIRED_TYPES = {1, 2, 3, 4}
-LOCATION_RELEVANT_TYPES = {1, 2, 3, 4, 6, 9}
+LOCATION_RELEVANT_TYPES = {1, 2, 3, 4, 5, 6, 9}
 EDITABLE_FIELDS = {
     1: "member_id",
     2: "machine_id",
@@ -127,8 +131,7 @@ def _resolve_lab_location(db, location_str):
     except Exception as exc:
         print(f"[ENGINE] Lab lookup failed: {exc}")
 
-    cleaned = str(location_str).strip() or None
-    return cleaned, None, None
+    return None, None, None
 
 
 def _merge_schema(schema: dict, extracted: dict) -> dict:
@@ -140,10 +143,29 @@ def _merge_schema(schema: dict, extracted: dict) -> dict:
 
 def _resolve_resource_candidates(db, schema: dict, raw_message: str):
     complaint_type = schema.get("type")
-    query = schema.get("resource_name") or raw_message
-    if complaint_type not in RESOURCE_TABLE_MAP or not query:
+    if complaint_type not in RESOURCE_TABLE_MAP:
         return []
-    return search_resource_candidates(db, complaint_type, query, schema.get("location_name"))
+
+    query_candidates = []
+    resource_name = schema.get("resource_name")
+    if resource_name:
+        query_candidates.append(resource_name)
+
+    for key in ("important_phrases", "important_terms"):
+        values = schema.get(key) or []
+        for value in values[:6]:
+            if value and value not in query_candidates:
+                query_candidates.append(value)
+
+    if raw_message and raw_message not in query_candidates:
+        query_candidates.append(raw_message)
+
+    for query in query_candidates:
+        rows = search_resource_candidates(db, complaint_type, query, schema.get("location_name"))
+        if rows:
+            return rows
+
+    return []
 
 
 def _apply_matched_resource(db, schema: dict, resource: object) -> dict:
@@ -152,10 +174,18 @@ def _apply_matched_resource(db, schema: dict, resource: object) -> dict:
     schema["resource_name"] = getattr(resource, config["name_field"])
     schema["resource_table"] = config["model"].__tablename__
 
-    if not schema.get("location_name"):
+    existing_location_id = schema.get("location_id")
+    existing_location_name = schema.get("location_name")
+    if existing_location_name and existing_location_id is None:
+        loc_name, loc_id, _ = _resolve_lab_location(db, existing_location_name)
+        schema["location_name"] = loc_name
+        schema["location_id"] = loc_id
+        existing_location_id = schema.get("location_id")
+
+    if existing_location_id is None:
         location_value = getattr(resource, config["location_field"])
         loc_name, loc_id, _ = _resolve_lab_location(db, location_value)
-        schema["location_name"] = loc_name or str(location_value)
+        schema["location_name"] = loc_name
         schema["location_id"] = loc_id
 
     return schema
@@ -171,14 +201,21 @@ def _enrich_schema_from_db(db, schema: dict, raw_message: str):
 
     if schema.get("location_name") and not schema.get("location_id"):
         loc_name, loc_id, _ = _resolve_lab_location(db, schema["location_name"])
-        schema["location_name"] = loc_name or schema["location_name"]
-        schema["location_id"] = loc_id
+        if loc_id is not None:
+            schema["location_name"] = loc_name
+            schema["location_id"] = loc_id
+        else:
+            schema["location_name"] = None
+            schema["location_id"] = None
 
     return schema, matched_resource, candidates
 
 
 def _next_missing_field(schema: dict) -> str | None:
     complaint_type = schema.get("type")
+
+    if not complaint_type:
+        return "type"
 
     if not schema.get("complaint_description"):
         return "complaint_description"
@@ -197,6 +234,8 @@ def _question_for_field(field: str, complaint_type: int | None) -> str:
 
     if field == "complaint_description":
         return f"I've classified this as a {type_name.lower()} complaint. What exactly is the issue?"
+    if field == "type":
+        return "I couldn't confidently identify the complaint type. Reply with one of: Equipment, Facility, Safety, Process, HR, IT, Purchase, Training, Inventory, Admin."
     if field == "resource_name":
         return f"This looks like a {type_name.lower()} complaint. Which {_resource_label(complaint_type)} is affected?"
     if field == "location_name":
@@ -236,10 +275,36 @@ def _coerce_edited_value(field_name: str, raw_value: str):
     if value.lower() in {"null", "none", ""}:
         return None
 
-    if field_name in {"member_id", "machine_id", "type", "location_id"}:
+    if field_name == "type":
+        return _parse_type_value(value)
+
+    if field_name in {"member_id", "machine_id", "location_id"}:
         return int(value)
 
     return value
+
+
+def _parse_type_value(raw_value: str):
+    value = raw_value.strip().lower()
+    type_map = {
+        "equipment": 1,
+        "facility": 2,
+        "safety": 3,
+        "process": 4,
+        "hr": 5,
+        "it": 6,
+        "purchase": 7,
+        "training": 8,
+        "inventory": 9,
+        "admin": 10,
+    }
+    if value.isdigit():
+        type_num = int(value)
+        if type_num in TYPE_NAMES:
+            return type_num
+    if value in type_map:
+        return type_map[value]
+    raise ValueError("invalid complaint type")
 
 
 def _apply_schema_edit(db, schema: dict, field_number: int, raw_value: str) -> dict:
@@ -249,11 +314,11 @@ def _apply_schema_edit(db, schema: dict, field_number: int, raw_value: str) -> d
 
     if field_name == "location_name":
         loc_name, loc_id, _ = _resolve_lab_location(db, value)
-        schema["location_name"] = loc_name or value
+        schema["location_name"] = loc_name
         schema["location_id"] = loc_id
     elif field_name == "location_id" and value is not None:
         loc_name, loc_id, _ = _resolve_lab_location(db, value)
-        schema["location_name"] = loc_name or schema.get("location_name")
+        schema["location_name"] = loc_name
         schema["location_id"] = loc_id
 
     return schema
@@ -301,15 +366,23 @@ def _prepare_initial_schema(db, member_id: int, message: str):
     schema["type"] = classify_complaint_type(message)
     schema["status"] = "Open"
 
-    if schema["type"] in RESOURCE_TABLE_MAP:
-        extracted = extract_complaint_schema(message, schema["type"])
-        schema = _merge_schema(schema, extracted)
+    local_extracted = extract_local_complaint_schema(message, schema["type"])
+    schema = _merge_schema(schema, local_extracted)
 
     if not schema.get("complaint_description"):
         schema["complaint_description"] = message
 
     schema, matched_resource, candidates = _enrich_schema_from_db(db, schema, message)
-    schema["type"] = classify_complaint_type(message, matched_machine=matched_resource)
+    schema["type"] = classify_complaint_type(message, matched_machine=matched_resource) or schema["type"]
+
+    if schema["type"] in RESOURCE_TABLE_MAP and not schema.get("machine_id") and not schema.get("resource_name"):
+        extracted = extract_complaint_schema(message, schema["type"])
+        schema = _merge_schema(schema, extracted)
+        schema, matched_resource, candidates = _enrich_schema_from_db(db, schema, message)
+        schema["type"] = classify_complaint_type(message, matched_machine=matched_resource) or schema["type"]
+
+    schema.pop("important_terms", None)
+    schema.pop("important_phrases", None)
 
     return schema, candidates
 
@@ -388,9 +461,13 @@ def _handle_collecting_info(db, state, message: str, user_phone: str) -> str:
 
     if current_field == "complaint_description":
         schema["complaint_description"] = answer
+    elif current_field == "type":
+        schema["type"] = _parse_type_value(answer)
     elif current_field == "location_name":
         loc_name, loc_id, _ = _resolve_lab_location(db, answer)
-        schema["location_name"] = loc_name or answer
+        if loc_id is None:
+            return "I could not find that location in our records. Please enter the lab name as stored in the system."
+        schema["location_name"] = loc_name
         schema["location_id"] = loc_id
     elif current_field == "resource_name":
         schema["resource_name"] = answer

@@ -9,6 +9,8 @@ python-multipart==0.0.9
 PyMySQL==1.1.1
 SQLAlchemy==2.0.28
 google-genai
+pandas==2.2.3
+nltk==3.9.1
 
 # QR Code generation
 qrcode[pil]==7.4.2

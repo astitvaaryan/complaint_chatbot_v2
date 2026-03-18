@@ -13,6 +13,7 @@ class Resources(Base):
     machid = Column(Integer, primary_key=True, index=True)
     name = Column(String(150))
     location = Column(String(250))
+    activation_status = Column(Integer)
     isworking = Column(Integer, default=1)
     category = Column(String(50))
 

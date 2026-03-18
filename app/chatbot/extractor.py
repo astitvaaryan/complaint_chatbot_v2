@@ -1,5 +1,6 @@
 """Structured resource lookup helpers for complaint registration."""
 
+import difflib
 import re
 from typing import Iterable, List
 
@@ -55,10 +56,14 @@ def _match_candidates(query_text: str, rows: Iterable[object], name_getter) -> L
     exact_matches = []
     prefix_matches = []
     partial_matches = []
+    fuzzy_matches = []
+    fuzzy_scores = []
 
     for row in rows:
         name_norm = _normalize_text(name_getter(row) or "")
         name_compact = _compact_text(name_getter(row) or "")
+        cat_norm = _normalize_text(getattr(row, "category", "") or "")
+        cat_compact = _compact_text(getattr(row, "category", "") or "")
         if not name_norm:
             continue
 
@@ -82,11 +87,44 @@ def _match_candidates(query_text: str, rows: Iterable[object], name_getter) -> L
         required = 1 if len(meaningful_msg_tokens) <= 1 else 2
         if len(overlap) >= required:
             partial_matches.append(row)
+            continue
+
+        compact_query = _compact_text(query_text)
+        if compact_query and len(compact_query) >= 4:
+            ratio = max(
+                difflib.SequenceMatcher(None, compact_query, name_compact).ratio(),
+                difflib.SequenceMatcher(None, compact_query, cat_compact).ratio() if cat_compact else 0,
+            )
+            if ratio >= 0.72:
+                fuzzy_matches.append(row)
+                fuzzy_scores.append((ratio, row))
 
     if exact_matches:
         return exact_matches
     if prefix_matches:
         return prefix_matches
+    if partial_matches:
+        unique = []
+        seen = set()
+        for row in partial_matches:
+            record_id = id(row)
+            if record_id not in seen:
+                seen.add(record_id)
+                unique.append(row)
+        return unique
+
+    if fuzzy_matches:
+        fuzzy_scores.sort(key=lambda item: item[0], reverse=True)
+        top_score = fuzzy_scores[0][0]
+        top_rows = [row for score, row in fuzzy_scores if score >= max(0.72, top_score - 0.08)]
+        unique = []
+        seen = set()
+        for row in top_rows:
+            record_id = id(row)
+            if record_id not in seen:
+                seen.add(record_id)
+                unique.append(row)
+        return unique
 
     unique = []
     seen = set()
