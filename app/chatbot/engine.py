@@ -23,7 +23,6 @@ Conversation steps:
 """
 
 import json
-import difflib
 import traceback
 from app.chatbot.db import SessionLocal
 from app.chatbot import models

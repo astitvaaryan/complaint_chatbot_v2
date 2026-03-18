@@ -29,7 +29,7 @@ TWILIO_WHATSAPP_NUMBER = "+14155238886"
 
 # The first message users need to send to join the sandbox
 # (Only needed for Twilio Sandbox — not for production)
-SANDBOX_JOIN_CODE = "join YOUR-TWO-WORDS-HERE"
+SANDBOX_JOIN_CODE = "join itself-pull"
 # ^ Go to console.twilio.com → Messaging → Try it out → Send a WhatsApp message
 # ^ Copy the 'join xxxx-xxxx' phrase shown there and paste it above
 

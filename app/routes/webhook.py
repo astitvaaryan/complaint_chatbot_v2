@@ -2,7 +2,16 @@ import traceback
 from fastapi import APIRouter, Request, Form
 from fastapi.responses import Response
 from twilio.twiml.messaging_response import MessagingResponse
-from app.database import get_users_by_mobile, get_user_by_mobile_and_email
+from app.database import (
+    get_users_by_mobile, 
+    get_user_by_mobile_and_email,
+    get_session, 
+    save_session, 
+    delete_session,
+    get_pending_ver, 
+    save_pending_ver, 
+    delete_pending_ver
+)
 from datetime import datetime
 from app.chatbot.engine import get_chatbot_reply   # top-level: crash on startup if broken
 
@@ -16,18 +25,8 @@ def twiml_response(resp: MessagingResponse) -> Response:
         headers={"Content-Type": "text/xml; charset=utf-8"}
     )
 
-# ─────────────────────────────────────────────────────────────────
-# In-memory stores
-#
-# sessions          → key: mobile  | value: fully authenticated user dict
-# pending_email_ver → key: mobile  | value: {"candidates": [user, …], "attempts": int}
-#
-# pending_email_ver holds numbers where the same phone belongs to
-# multiple accounts.  The user must reply with their registered email
-# to resolve which account to authenticate.
-# ─────────────────────────────────────────────────────────────────
-sessions:          dict = {}
-pending_email_ver: dict = {}
+# Sessions and pending verifications are now handled via database persistence (app/database.py)
+# The local dicts are removed to ensure multi-process safety and persistence after restarts.
 
 MAX_EMAIL_ATTEMPTS = 3   # lock out after this many wrong emails
 
@@ -99,7 +98,7 @@ def _admit_user(mobile: str, user: dict, incoming_msg: str) -> str:
     Save user to session and return the first response.
     Called once authentication is complete (either path).
     """
-    sessions[mobile] = user
+    save_session(mobile, user)
     print(f"✅ Logged in: {user['fname']} {user['lname']} ({user['position']})")
 
     msg_lower = incoming_msg.lower().strip()
@@ -139,18 +138,19 @@ async def whatsapp_webhook(
     resp = MessagingResponse()
 
     # ── PATH 1: Returning user already in session ─────────────────
-    if mobile in sessions:
-        user = sessions[mobile]
+    session_user = get_session(mobile)
+    if session_user:
+        user = session_user
 
         # Explicit Logout Command
         if incoming_msg.lower().strip() == "logout":
-            del sessions[mobile]
+            delete_session(mobile)
             resp.message("👋 You have been logged out successfully. You will be asked to authenticate again on your next message.")
             return twiml_response(resp)
 
         # Continual Expiry Check (Ensure they weren't removed while in-session)
         if is_account_expired(user.get("expiry_date", "")):
-            del sessions[mobile]
+            delete_session(mobile)
             resp.message(
                 f"Hi {user['fname']}! Your account expired on {user.get('expiry_date', 'unknown')}. "
                 f"Please reach out to the administrator to renew access. 🙏"
@@ -161,8 +161,8 @@ async def whatsapp_webhook(
         return twiml_response(resp)
 
     # ── PATH 2: Waiting for email verification ────────────────────
-    if mobile in pending_email_ver:
-        state      = pending_email_ver[mobile]
+    state = get_pending_ver(mobile)
+    if state:
         
         # Ignore basic greetings so we don't penalize the user
         if incoming_msg.lower().strip() in ["hi", "hello", "hey"]:
@@ -173,13 +173,14 @@ async def whatsapp_webhook(
             
         candidates = state["candidates"]
         state["attempts"] += 1
+        save_pending_ver(mobile, candidates, state["attempts"])
 
         # Check if user typed their email
         matched_user = get_user_by_mobile_and_email(mobile, incoming_msg)
 
         if matched_user:
             # Correct email — clear pending state and admit
-            del pending_email_ver[mobile]
+            delete_pending_ver(mobile)
 
             if is_account_expired(matched_user.get("expiry_date", "")):
                 resp.message(
@@ -194,7 +195,7 @@ async def whatsapp_webhook(
         # Wrong email
         attempts_left = MAX_EMAIL_ATTEMPTS - state["attempts"]
         if attempts_left <= 0:
-            del pending_email_ver[mobile]
+            delete_pending_ver(mobile)
             resp.message(
                 "❌ Too many incorrect attempts. "
                 "Please contact the lab administrator for help. 🙏"
@@ -235,7 +236,7 @@ async def whatsapp_webhook(
 
     # ── PATH 4: Duplicate phone numbers → email verification ──────
     print(f"[AUTH] Duplicate mobile {mobile} — {len(users)} accounts found. Asking for email.")
-    pending_email_ver[mobile] = {"candidates": users, "attempts": 0}
+    save_pending_ver(mobile, users, 0)
 
     resp.message(
         "📋 We found multiple accounts registered with this phone number.\n\n"

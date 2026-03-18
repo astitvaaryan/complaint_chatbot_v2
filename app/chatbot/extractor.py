@@ -109,6 +109,7 @@ def extract_machine_candidates(message: str, machines: List[any]) -> List[any]:
         required = 1 if len(meaningful_msg_tokens) <= 1 else 2
         if len(overlap) >= required:
             partial_matches.append(machine)
+            continue
 
     # Return highest-priority non-empty list
     if exact_matches:
