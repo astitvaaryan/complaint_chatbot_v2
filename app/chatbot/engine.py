@@ -12,7 +12,7 @@ from app.chatbot.classifier import (
     extract_local_complaint_schema,
 )
 from app.chatbot.db import SessionLocal
-from app.chatbot.extractor import RESOURCE_TABLE_MAP, search_resource_candidates
+from app.chatbot.extractor import RESOURCE_TABLE_MAP, search_resource_candidates, smart_rapidfuzz_search
 from app.chatbot.state_manager import clear_state, get_state, parse_collected_data, upsert_state
 
 TYPE_NAMES = {
@@ -192,23 +192,54 @@ def _apply_matched_resource(db, schema: dict, resource: object) -> dict:
 
 
 def _enrich_schema_from_db(db, schema: dict, raw_message: str):
-    matched_resource = None
-    candidates = _resolve_resource_candidates(db, schema, raw_message)
+    nouns = []
+    r_name = schema.get("resource_name")
+    if r_name and str(r_name).strip():
+        nouns.append(r_name)
+    for key in ("important_phrases", "important_terms"):
+        for val in schema.get(key, []):
+            if val and str(val).strip() and val not in nouns:
+                nouns.append(val)
+    if not nouns and raw_message:
+        nouns.append(raw_message)
 
-    if len(candidates) == 1:
-        matched_resource = candidates[0]
-        schema = _apply_matched_resource(db, schema, matched_resource)
+    results = smart_rapidfuzz_search(db, nouns)
+    p_matches = results["physical_matches"]
+    a_matches = results["abstract_matches"]
+    
+    unique_cats = set(p_matches.keys()).union(a_matches)
+    
+    p_matches_ids = {}
+    for t_id, rows in p_matches.items():
+        p_matches_ids[str(t_id)] = [
+            getattr(r, "machid", getattr(r, "device_id", None)) 
+            for r in rows
+        ]
+    schema["_rf_candidates"] = p_matches_ids
+    schema["_rf_categories"] = list(unique_cats)
 
-    if schema.get("location_name") and not schema.get("location_id"):
-        loc_name, loc_id, _ = _resolve_lab_location(db, schema["location_name"])
-        if loc_id is not None:
-            schema["location_name"] = loc_name
-            schema["location_id"] = loc_id
-        else:
-            schema["location_name"] = None
-            schema["location_id"] = None
+    candidates = []
+    if not unique_cats:
+        if not schema.get("resource_name") and nouns:
+            schema["resource_name"] = nouns[0]
+        return schema, None, []
 
-    return schema, matched_resource, candidates
+    if len(unique_cats) == 1:
+        cat_id = list(unique_cats)[0]
+        schema["type"] = cat_id
+        if cat_id in p_matches:
+            candidates = p_matches[cat_id]
+            if len(candidates) == 1:
+                matched_resource = candidates[0]
+                schema = _apply_matched_resource(db, schema, matched_resource)
+                if schema.get("location_name"):
+                    schema["_require_location_confirm"] = True
+    else:
+        for c in unique_cats:
+            if c in p_matches:
+                candidates.extend(p_matches[c])
+
+    return schema, None, candidates
 
 
 def _next_missing_field(schema: dict) -> str | None:
@@ -411,6 +442,20 @@ def _store_selection_state(db, user_phone: str, schema: dict, candidates):
 
 
 def _continue_or_confirm(db, user_phone: str, schema: dict, candidates=None) -> str:
+    rf_cats = schema.get("_rf_categories", [])
+    
+    if len(rf_cats) > 1 and not schema.get("type"):
+        upsert_state(db, user_phone, "select_category", {"schema": schema, "categories": rf_cats})
+        lines = ["Which type of issue is it? Reply with the number:"]
+        for idx, c in enumerate(rf_cats, start=1):
+            lines.append(f"{idx}. {TYPE_NAMES.get(c, 'Unknown')}")
+        return "\n".join(lines)
+        
+    if schema.pop("_require_location_confirm", False):
+        loc = schema.get("location_name")
+        upsert_state(db, user_phone, "confirm_location", {"schema": schema})
+        return f"I found this equipment is normally located in {loc}. Is that correct? (Yes/No)"
+
     complaint_type = schema.get("type")
 
     if candidates and len(candidates) > 1 and complaint_type in RESOURCE_REQUIRED_TYPES and not schema.get("machine_id"):
@@ -419,6 +464,9 @@ def _continue_or_confirm(db, user_phone: str, schema: dict, candidates=None) -> 
 
     next_field = _next_missing_field(schema)
     if next_field:
+        if next_field == "resource_name" and not schema.get("resource_name"):
+            _store_collection_state(db, user_phone, schema, next_field)
+            return "I could not find a specific match for your issue. Please properly describe the equipment or issue again."
         _store_collection_state(db, user_phone, schema, next_field)
         return _question_for_field(next_field, complaint_type)
 
@@ -512,7 +560,61 @@ def _handle_confirmation(db, state, message: str, user_phone: str) -> str:
     return "Reply 'yes' to register the complaint or 'no' to cancel."
 
 
+def _handle_category_selection(db, state, message: str, user_phone: str) -> str:
+    data = parse_collected_data(state)
+    schema = data.get("schema", {})
+    categories = data.get("categories", [])
+    
+    if not message.strip().isdigit():
+        return "Reply with the number from the list."
+        
+    choice = int(message.strip())
+    if choice < 1 or choice > len(categories):
+        return "That number is not valid. Reply with one of the listed numbers."
+        
+    selected_cat = categories[choice - 1]
+    schema["type"] = selected_cat
+    schema["_rf_categories"] = [selected_cat]
+    
+    p_matches_ids = schema.get("_rf_candidates", {})
+    ids = p_matches_ids.get(str(selected_cat), [])
+    
+    config = RESOURCE_TABLE_MAP.get(selected_cat)
+    candidates = []
+    if config and ids:
+        model = config["model"]
+        id_field = getattr(model, config["id_field"])
+        candidates = db.query(model).filter(id_field.in_(ids)).all()
+        
+    if len(candidates) == 1:
+        schema = _apply_matched_resource(db, schema, candidates[0])
+        if schema.get("location_name"):
+            schema["_require_location_confirm"] = True
+
+    return _continue_or_confirm(db, user_phone, schema, candidates)
+
+
+def _handle_location_confirmation(db, state, message: str, user_phone: str) -> str:
+    data = parse_collected_data(state)
+    schema = data.get("schema", {})
+    msg = message.lower().strip()
+    
+    if msg in YES_WORDS:
+        pass
+    elif msg in NO_WORDS:
+        schema["location_name"] = None
+        schema["location_id"] = None
+    else:
+        return "Please reply 'yes' or 'no'."
+        
+    return _continue_or_confirm(db, user_phone, schema)
+
+
 def _handle_ongoing_conversation(db, state, message: str, user_phone: str) -> str:
+    if state.current_step == "select_category":
+        return _handle_category_selection(db, state, message, user_phone)
+    if state.current_step == "confirm_location":
+        return _handle_location_confirmation(db, state, message, user_phone)
     if state.current_step == "select_resource":
         return _handle_resource_selection(db, state, message, user_phone)
 

@@ -1,8 +1,8 @@
-"""Structured resource lookup helpers for complaint registration."""
+"""Structured resource lookup helpers using 2-Tier RapidFuzz Smart Search."""
 
-import difflib
 import re
-from typing import Iterable, List
+from typing import Iterable, List, Dict, Any
+from rapidfuzz import fuzz
 
 from app.chatbot import models
 
@@ -15,141 +15,19 @@ STOP_WORDS = {
     "complaint", "device", "equipment", "machine", "resource", "safety",
 }
 
-
-def _normalize_text(value: str) -> str:
-    return re.sub(r"\s+", " ", str(value).strip().lower())
-
-
-def _compact_text(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", str(value).lower())
-
-
-def _tokenize(value: str) -> set:
-    tokens = set(re.findall(r"[a-z0-9]+", str(value).lower()))
-    expanded = set(tokens)
-    for token in tokens:
-        parts = re.findall(r"[a-z]+|\d+", token)
-        expanded.update(parts)
-    return expanded
-
-
-def _extract_lookup_query(message: str) -> str:
-    words = _normalize_text(message).split()
-    meaningful = [word for word in words if word not in STOP_WORDS and len(word) > 1]
-    return " ".join(meaningful)
-
-
-def _is_prefix_boundary(name_norm: str, query: str) -> bool:
-    if not name_norm.startswith(query):
-        return False
-    remainder_idx = len(query)
-    if remainder_idx >= len(name_norm):
-        return True
-    return name_norm[remainder_idx] in ("_", " ", "-", "/", ".")
-
-
-def _match_candidates(query_text: str, rows: Iterable[object], name_getter) -> List[object]:
-    msg_norm = _normalize_text(query_text)
-    msg_tokens = _tokenize(query_text)
-    query = _extract_lookup_query(query_text)
-
-    exact_matches = []
-    prefix_matches = []
-    partial_matches = []
-    fuzzy_matches = []
-    fuzzy_scores = []
-
-    for row in rows:
-        name_norm = _normalize_text(name_getter(row) or "")
-        name_compact = _compact_text(name_getter(row) or "")
-        cat_norm = _normalize_text(getattr(row, "category", "") or "")
-        cat_compact = _compact_text(getattr(row, "category", "") or "")
-        if not name_norm:
-            continue
-
-        if re.search(rf"\b{re.escape(name_norm)}\b", msg_norm):
-            exact_matches.append(row)
-            continue
-
-        if _compact_text(query_text) and _compact_text(query_text) in name_compact:
-            exact_matches.append(row)
-            continue
-
-        if query and _is_prefix_boundary(name_norm, query):
-            prefix_matches.append(row)
-            continue
-
-        name_tokens = _tokenize(name_norm)
-        cat_tokens  = _tokenize(cat_norm)
-        meaningful_msg_tokens = msg_tokens - STOP_WORDS
-        
-        overlap = (name_tokens | cat_tokens).intersection(meaningful_msg_tokens)
-        required = 1 if len(meaningful_msg_tokens) <= 1 else 2
-        if len(overlap) >= required:
-            partial_matches.append(row)
-            continue
-
-        compact_query = _compact_text(query_text)
-        if compact_query and len(compact_query) >= 4:
-            ratio = max(
-                difflib.SequenceMatcher(None, compact_query, name_compact).ratio(),
-                difflib.SequenceMatcher(None, compact_query, cat_compact).ratio() if cat_compact else 0,
-            )
-            if ratio >= 0.72:
-                fuzzy_matches.append(row)
-                fuzzy_scores.append((ratio, row))
-
-    if exact_matches:
-        return exact_matches
-    if prefix_matches:
-        return prefix_matches
-    if partial_matches:
-        unique = []
-        seen = set()
-        for row in partial_matches:
-            record_id = id(row)
-            if record_id not in seen:
-                seen.add(record_id)
-                unique.append(row)
-        return unique
-
-    if fuzzy_matches:
-        fuzzy_scores.sort(key=lambda item: item[0], reverse=True)
-        top_score = fuzzy_scores[0][0]
-        top_rows = [row for score, row in fuzzy_scores if score >= max(0.72, top_score - 0.08)]
-        unique = []
-        seen = set()
-        for row in top_rows:
-            record_id = id(row)
-            if record_id not in seen:
-                seen.add(record_id)
-                unique.append(row)
-        return unique
-
-    unique = []
-    seen = set()
-    for row in partial_matches:
-        record_id = id(row)
-        if record_id not in seen:
-            seen.add(record_id)
-            unique.append(row)
-    return unique
-
-
-def _narrow_by_location(location_hint: str, rows: Iterable[object], location_getter) -> List[object]:
-    if not location_hint:
-        return list(rows)
-
-    hint = _normalize_text(location_hint)
-    return [
-        row for row in rows
-        if hint in _normalize_text(location_getter(row) or "")
-    ]
-
+# Tier 2: Static dictionary mappings for abstract classes
+ABSTRACT_MAPPINGS = {
+    5: ["hr", "human resources", "salary", "leave", "payroll", "employee", "manager", "benefits"],
+    6: ["it", "computer", "network", "internet", "wifi", "software", "printer", "login", "password", "server", "email", "hardware"],
+    7: ["purchase", "buy", "order", "vendor", "procurement", "invoice", "payment", "quote"],
+    8: ["training", "learn", "course", "tutorial", "guide", "onboarding", "workshop"],
+    9: ["inventory", "stock", "supply", "spare", "material", "warehouse", "shortage"],
+    10: ["admin", "administration", "cleaning", "housekeeping", "security", "access", "badge", "id card"]
+}
 
 RESOURCE_TABLE_MAP = {
     1: {
-        "model": models.Resources,
+        "model": models.EqpProcessResource,
         "name_field": "name",
         "id_field": "machid",
         "location_field": "location",
@@ -173,7 +51,7 @@ RESOURCE_TABLE_MAP = {
         "active_value": 1,
     },
     4: {
-        "model": models.Resources,
+        "model": models.EqpProcessResource,
         "name_field": "name",
         "id_field": "machid",
         "location_field": "location",
@@ -182,29 +60,102 @@ RESOURCE_TABLE_MAP = {
     },
 }
 
+def _normalize_text(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value).strip().lower())
+
+def _extract_lookup_query(message: str) -> str:
+    words = _normalize_text(message).split()
+    meaningful = [word for word in words if word not in STOP_WORDS and len(word) > 1]
+    return " ".join(meaningful)
+
+def _tier1_physical_search(db, nouns: List[str]) -> Dict[int, List[object]]:
+    """Tier 1: Search Physical DB tables using fuzz.token_set_ratio with 65% threshold."""
+    results = {}
+    
+    for noun in nouns:
+        query_norm = _extract_lookup_query(noun)
+        if not query_norm:
+            continue
+            
+        for type_id in [1, 2, 3]:
+            config = RESOURCE_TABLE_MAP[type_id]
+            model = config["model"]
+            active_field = getattr(model, config["active_field"])
+            
+            rows = db.query(model).filter(active_field == config["active_value"]).all()
+            
+            for row in rows:
+                name_val = getattr(row, config["name_field"], "")
+                if not name_val:
+                    continue
+                name_norm = _normalize_text(name_val)
+                
+                score = fuzz.token_set_ratio(query_norm, name_norm)
+                if score >= 65.0:
+                    if type_id not in results:
+                        results[type_id] = []
+                    # Keep unique objects
+                    if not any(id(existing) == id(row) for existing in results[type_id]):
+                        results[type_id].append(row)
+                        
+    return results
+
+def _tier2_abstract_search(nouns: List[str]) -> List[int]:
+    """Tier 2: Search abstract classes using fuzz.WRatio."""
+    matched_types = set()
+    
+    for noun in nouns:
+        query_norm = _normalize_text(noun)
+        if not query_norm:
+            continue
+            
+        for type_id, keywords in ABSTRACT_MAPPINGS.items():
+            for kw in keywords:
+                score = fuzz.WRatio(query_norm, kw)
+                if score >= 80.0:  # Strong match required for WRatio
+                    matched_types.add(type_id)
+                    break
+                    
+    return list(matched_types)
+
+def smart_rapidfuzz_search(db, nouns: List[str]) -> Dict[str, Any]:
+    """
+    Executes the comprehensive 2-Tier RapidFuzz search across all nouns.
+    Returns:
+        {
+            "physical_matches": {category_id: [resource_objects]},
+            "abstract_matches": [category_id_1, category_id_2]
+        }
+    """
+    valid_nouns = [n for n in nouns if str(n).strip()]
+    
+    return {
+        "physical_matches": _tier1_physical_search(db, valid_nouns),
+        "abstract_matches": _tier2_abstract_search(valid_nouns)
+    }
+
+def _narrow_by_location(location_hint: str, rows: Iterable[object], location_getter) -> List[object]:
+    if not location_hint:
+        return list(rows)
+    hint = _normalize_text(location_hint)
+    return [
+        row for row in rows
+        if hint in _normalize_text(location_getter(row) or "")
+    ]
 
 def search_resource_candidates(db, complaint_type: int, lookup_text: str, location_hint: str | None = None) -> List[object]:
-    config = RESOURCE_TABLE_MAP.get(complaint_type)
-    if not config or not lookup_text:
+    """Fallback legacy support using RapidFuzz Tier 1."""
+    if complaint_type not in RESOURCE_TABLE_MAP:
         return []
-
-    model = config["model"]
-    active_field = getattr(model, config["active_field"])
-    rows = db.query(model).filter(active_field == config["active_value"]).all()
-    if not rows and complaint_type == 2:
-        fallback = RESOURCE_TABLE_MAP[1]
-        model = fallback["model"]
-        active_field = getattr(model, fallback["active_field"])
-        rows = db.query(model).filter(active_field == fallback["active_value"]).all()
-        config = fallback
-
-    candidates = _match_candidates(
-        lookup_text,
-        rows,
-        lambda row: getattr(row, config["name_field"], None),
-    )
-
+        
+    res = _tier1_physical_search(db, [lookup_text])
+    
+    candidates = res.get(complaint_type, [])
+    if not candidates and complaint_type == 2:
+        candidates = res.get(1, [])  # Fallback to Equipment
+        
     if len(candidates) > 1 and location_hint:
+        config = RESOURCE_TABLE_MAP.get(complaint_type, RESOURCE_TABLE_MAP[1])
         narrowed = _narrow_by_location(
             location_hint,
             candidates,
@@ -215,6 +166,5 @@ def search_resource_candidates(db, complaint_type: int, lookup_text: str, locati
 
     return candidates
 
-
-def extract_machine_db(message: str, db) -> List[models.Resources]:
+def extract_machine_db(message: str, db) -> List[models.EqpProcessResource]:
     return search_resource_candidates(db, 1, message)

@@ -1,4 +1,4 @@
-from app.database import get_connection, get_user_by_mobile
+from app.database import get_connection, get_users_by_mobile
 import os
 from dotenv import load_dotenv
 
@@ -19,7 +19,8 @@ def test_connection():
         
         # Test a query
         test_number = input("\nEnter your WhatsApp number to test (e.g. 9876543210): ")
-        user = get_user_by_mobile(test_number)
+        users = get_users_by_mobile(test_number)
+        user = users[0] if users else None
         if user:
             print("\n[SUCCESS] User found!")
             print(f"Name: {user['fname']}")
@@ -29,7 +30,7 @@ def test_connection():
             print(f"\n[WARNING] User with number {test_number} not found in the 'login' table.")
 
         # Test unknown number
-        unknown = get_user_by_mobile("0000000000")
+        unknown = get_users_by_mobile("0000000000")
         if not unknown:
             print("[SUCCESS] Correctly returned None for unknown number")
             

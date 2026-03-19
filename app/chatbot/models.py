@@ -6,8 +6,20 @@ from sqlalchemy.sql import func
 from app.chatbot.db import Base
 
 
-class Resources(Base):
-    __tablename__ = "resources"
+# class Resources(Base):
+#     __tablename__ = "resources"
+#     __table_args__ = {"extend_existing": True}
+
+#     machid = Column(Integer, primary_key=True, index=True)
+#     name = Column(String(150))
+#     location = Column(String(250))
+#     activation_status = Column(Integer)
+#     isworking = Column(Integer, default=1)
+#     category = Column(String(50))
+
+
+class EqpProcessResource(Base):
+    __tablename__ = "eqp-process_resources"
     __table_args__ = {"extend_existing": True}
 
     machid = Column(Integer, primary_key=True, index=True)
@@ -19,7 +31,7 @@ class Resources(Base):
 
 
 class FacilityResource(Base):
-    __tablename__ = "facility_resources"
+    __tablename__ = "resources"
     __table_args__ = {"extend_existing": True}
 
     machid = Column(Integer, primary_key=True, index=True)
