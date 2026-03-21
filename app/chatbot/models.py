@@ -19,7 +19,7 @@ from app.chatbot.db import Base
 
 
 class EqpProcessResource(Base):
-    __tablename__ = "eqp-process_resources"
+    __tablename__ = "resources"
     __table_args__ = {"extend_existing": True}
 
     machid = Column(Integer, primary_key=True, index=True)
@@ -31,7 +31,7 @@ class EqpProcessResource(Base):
 
 
 class FacilityResource(Base):
-    __tablename__ = "resources"
+    __tablename__ = "facility_resources"
     __table_args__ = {"extend_existing": True}
 
     machid = Column(Integer, primary_key=True, index=True)

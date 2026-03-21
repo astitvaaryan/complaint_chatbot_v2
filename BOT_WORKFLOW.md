@@ -1,75 +1,519 @@
-# WhatsApp Complaint Chatbot - Complete Workflow Architecture
+# WhatsApp Complaint Chatbot Workflow
 
-This document completely outlines the architecture, data-flow, and internal logic of the WhatsApp Complaint Chatbot backend.
+This document describes the current end-to-end workflow of the chatbot as implemented in the backend.
 
-## 1. Overview
-The bot is designed to receive natural language complaints via a WhatsApp Twilio webhook, intelligently identify the affected equipment/issue type, confirm its location, and successfully register the complaint in the MySQL Database (`slotbooking` via `.env`).
+## 1. Purpose
 
-The bot handles complex natural language scenarios by passing the message through a 3-step pipeline: **Extraction**, **Search**, and **Neural Routing**.
+The bot receives a WhatsApp complaint message through Twilio, identifies the complaint type, fills a backend complaint schema, asks only for missing information, shows the final schema for review, allows edits, and registers the complaint in the database after confirmation.
 
----
+The system is designed to:
 
-## 2. The Processing Pipeline
+- identify the complaint type as early as possible
+- use database lookups wherever possible instead of asking unnecessary questions
+- use Gemini only as a support layer, not as the primary workflow
+- keep the complaint conversation stateful across multiple user replies
 
-### Step 1: Message Ingestion (`classifier.py`)
-When a user sends a message, it is passed into the `new_classifier.py`:
-- Nouns and contextual tokens are extracted to identify the issue.
-- The system generates a base `schema` dictionary caching variables like: `resource_name`, `important_phrases`, and `important_terms`.
-- A preliminary complaint `type` prediction (e.g., Equipment, Facility, IT, HR) is attached.
+## 2. Main Backend Modules
 
-### Step 2: 2-Tier RapidFuzz Smart Search (`extractor.py`)
-Rather than relying on basic substring matching, the chatbot uses a massive **2-Tier RapidFuzz** search engine to map the extracted nouns to internal DB categories:
+### `app/routes/webhook.py`
 
-*   **Tier 1 (Physical Matches):** The system scans 3 physical hardware tables (`eqp-process_resources`, `resources`, `safety_device`).
-    *   It filters strictly for ACTIVE records (using `isworking` / `activation_status`).
-    *   It uses `fuzz.token_set_ratio` with a cutoff threshold of `>= 65.0`.
-*   **Tier 2 (Keyword/Abstract Matches):** The system cross-references non-physical nouns against 6 abstract categories (HR, IT, Admin, Training, Purchase, Inventory).
-    *   It uses `fuzz.WRatio` with a strict cutoff of `>= 80.0`.
+Handles Twilio WhatsApp webhook requests.
 
-### Step 3: The 5-Case Neural Routing Logic (`engine.py`)
-Once `smart_rapidfuzz_search()` returns the dictionary of matches and categories, `engine.py` dictates the flow of the conversation across 5 intelligently handled cases:
+Responsibilities:
 
-1.  **Exact Hit (Single Category, Single Machine):**
-    *   *Logic:* Extracts the machine ID, automatically fetches the lab Location, and safely prompts the user to verify.
-    *   *Bot says:* "I found this equipment is normally located in [Location]. Is that correct? (Yes/No)"
-2.  **Category Collision (Multiple unique Categories hit):**
-    *   *Logic:* Prioritizes categorizing the general issue first. Stores only the raw Database IDs into the serialized state (to avoid JSON crashes).
-    *   *Bot says:* "Which type of issue is it?" *(Proceeds to list the identified categories)*
-3.  **Machine Collision (Single Category, Multiple Machines):**
-    *   *Logic:* If the keyword (e.g., "Fan") matches multiple active entries in that category, the bot lists them cleanly across location lines.
-    *   *Bot says:* "I found multiple matching records. Reply with the number:"
-4.  **Confirming Missing Data:**
-    *   *Logic:* Evaluates if any explicit pieces are missing (e.g., a "type" but no "location"). 
-    *   *Bot says:* "Noted. Where is this facility issue happening?"
-5.  **0-Match Fallback (The Smart Buffer):**
-    *   *Logic:* If the hardware isn't registered in the DB, the engine prevents frustrating fallback loops. It bypasses Database confirmation, directly injecting the raw user string natively into `schema["resource_name"]`.
+- normalize the sender phone number
+- authenticate the user by mobile number
+- handle duplicate mobile numbers using email verification
+- route authenticated user messages to the chatbot engine
+- return TwiML response text back to Twilio
 
----
+### `app/chatbot/engine.py`
 
-## 3. Persistent State Management
-To support multi-turn conversations without blocking threads, the chatbot implements a conversational State Manager (`state_manager.py` & `engine.py`):
-- All ongoing interactions cache the active `schema` configuration dictionary against the user's phone number inside the `conversation_state` database table.
-- Temporary contexts (like `select_category` or `confirm_location`) track what exactly the bot is expecting next.
-- If a user says `"cancel"`, `"reset"`, or says `"no"` during confirmation, the context row is immediately deleted so the process starts fresh.
+This is the main orchestration layer.
 
----
+Responsibilities:
 
-## 4. Final Complaint Registration
-Once all `EDITABLE_FIELDS` in the schema are populated and the user replies `"yes"` to the final JSON-rendered prompt, the engine invokes `_register_complaint()`:
-- Automatically formats timestamps (`time_of_complaint`).
-- Converts the final mapped keys into the SQLAlchemy `Complaint` model.
-- Registers it under the respective `member_id` into the complaint table.
-- Appends the ultimate success message bridging back to WhatsApp. 
+- create and update the complaint schema
+- call classifier and extractor logic
+- resolve locations and resource IDs from database tables
+- decide the next question to ask
+- manage confirmation, editing, and registration
+- manage multi-turn complaint state
 
----
+### `app/chatbot/new_classifier.py`
 
-### Database Configurations
-The central database relies heavily on the environment configuration for portability. Ensure your local `.env` contains the required keys:
+This is the production classifier module.
+
+Responsibilities:
+
+- preprocess user complaint text
+- extract important words and phrases
+- optionally use Gemini to improve extraction
+- classify complaint type
+- support fallback schema extraction when needed
+
+`app/chatbot/classifier.py` is currently a compatibility wrapper over `new_classifier.py`.
+
+### `app/chatbot/extractor.py`
+
+Provides resource lookup logic.
+
+Responsibilities:
+
+- search physical resource tables
+- search abstract complaint categories
+- support RapidFuzz-based matching for noisy user text
+
+### `app/chatbot/state_manager.py`
+
+Stores conversation state in the database.
+
+Responsibilities:
+
+- save the current complaint schema per user
+- resume multi-turn conversations
+- clear state on cancel or completion
+
+### `app/chatbot/models.py`
+
+Contains SQLAlchemy models for the chatbot-relevant tables.
+
+Current important models:
+
+- `EqpProcessResource` -> `resources`
+- `FacilityResource` -> `facility_resources`
+- `SafetyDevice` -> `safety_device`
+- `LabIncharge` -> `lab_incharge`
+- `Complaint` -> `complaint`
+- `ConversationState` -> `conversation_state`
+- `ComplaintKeyword` -> `complaint_it_keywords`
+
+## 3. Complaint Schema
+
+The chatbot works around a backend schema that is initialized with `None` values.
+
+Current schema fields:
+
+```json
+{
+  "member_id": null,
+  "machine_id": null,
+  "complaint_description": null,
+  "type": null,
+  "status": null,
+  "time_of_complaint": null,
+  "location_name": null,
+  "location_id": null,
+  "resource_name": null,
+  "resource_table": null
+}
 ```
-DB_HOST=localhost
-DB_PORT=3306
-DB_NAME=slotbooking
-DB_USER=root
-DB_PASSWORD=your_password
+
+Not all fields are shown to the user. The editable confirmation currently exposes:
+
+- `member_id`
+- `machine_id`
+- `complaint_description`
+- `type`
+- `status`
+- `time_of_complaint`
+- `location_name`
+- `location_id`
+
+## 4. Supported Complaint Types
+
+The bot currently uses these type IDs:
+
+| Type ID | Type Name |
+|---|---|
+| 1 | Equipment |
+| 2 | Facility |
+| 3 | Safety |
+| 4 | Process |
+| 5 | HR |
+| 6 | IT |
+| 7 | Purchase |
+| 8 | Training |
+| 9 | Inventory |
+| 10 | Admin |
+
+## 5. High-Level Runtime Flow
+
+### Step 1: User sends a WhatsApp message
+
+Twilio calls `POST /webhook`.
+
+The webhook:
+
+- extracts `From` and `Body`
+- normalizes the sender number
+- authenticates the user
+- forwards the message to `get_chatbot_reply()`
+
+### Step 2: Session and state check
+
+`get_chatbot_reply()` in `engine.py` checks:
+
+- whether the user wants to `cancel`, `reset`, `stop`, or `abort`
+- whether the user wants to `undo`, `delete`, `remove`, or `revert` the latest complaint
+- whether the user already has an active complaint conversation in `conversation_state`
+
+If a conversation state exists, the engine continues that flow.
+
+If not, it starts a new complaint flow.
+
+### Step 3: Initial schema preparation
+
+`_prepare_initial_schema()` creates a blank schema and fills:
+
+- `member_id`
+- preliminary `type`
+- `status = "Open"`
+
+Then it performs local extraction and DB enrichment.
+
+### Step 4: Complaint text extraction
+
+`extract_local_complaint_schema()` in `new_classifier.py` runs first.
+
+It:
+
+- preprocesses text
+- normalizes tokens
+- extracts keywords
+- generates phrases
+- tries to detect a location phrase
+- optionally calls Gemini to extract better:
+  - `important_terms`
+  - `important_phrases`
+  - `resource_name`
+  - `location_name`
+
+Gemini is cached and rate-limited through backoff logic:
+
+- `_extract_with_gemini()` uses `@lru_cache`
+- if Gemini returns `429` or `RESOURCE_EXHAUSTED`, the system temporarily disables Gemini calls and falls back locally
+
+The extracted values are merged into the schema.
+
+### Step 5: Initial location normalization
+
+After extraction, the engine tries to resolve `location_name` into `location_id`.
+
+This is done by `_resolve_schema_location()` and `_resolve_lab_location()`.
+
+Location resolution rules:
+
+- if the input is a numeric id, search `lab_incharge.locationid`
+- else try direct text matching on `lab_incharge.location`
+- else try normalized matching
+- else use constrained fuzzy matching
+- if no valid lab is found, unresolved free-text locations are cleared before final confirmation
+
+This means invalid phrases like `the chamber` should not remain as final locations.
+
+### Step 6: DB enrichment and type/resource discovery
+
+`_enrich_schema_from_db()` tries to infer more information from database search.
+
+It collects search nouns from:
+
+- `resource_name`
+- `important_phrases`
+- `important_terms`
+- raw message
+
+Then it calls `smart_rapidfuzz_search()` from `extractor.py`.
+
+That function performs a 2-layer search:
+
+#### Layer A: Physical resource search
+
+Searches these tables:
+
+- `resources`
+- `facility_resources`
+- `safety_device`
+
+The result is stored as `physical_matches`.
+
+#### Layer B: Abstract category search
+
+Searches keyword groups for:
+
+- HR
+- IT
+- Purchase
+- Training
+- Inventory
+- Admin
+
+The result is stored as `abstract_matches`.
+
+The union of these matches becomes `_rf_categories` in the schema.
+
+### Step 7: Type classification
+
+The classifier logic in `classify_complaint_type()` currently works in this order:
+
+1. if a matched physical DB row is already known, use that signal
+2. strong curated keyword checks for non-physical categories
+3. table-based detection using extracted resource phrases and DB search
+4. IT keyword detection using `complaint_it_keywords`
+5. generic keyword scoring
+6. Gemini classification fallback
+7. tie-break priority if needed
+
+Important points:
+
+- `complaint_it_keywords` is used only as a strong IT signal
+- noisy IT keywords are filtered using `IT_KEYWORD_BLACKLIST`
+- table detection is intentionally prioritized before IT keyword forcing so physical resource mentions are not easily overridden by generic IT words
+
+### Step 8: Resource match handling
+
+If DB enrichment finds one matched physical resource:
+
+- `machine_id` is filled
+- `resource_name` is filled
+- `resource_table` is filled
+- location is taken from the matched resource row and mapped to `lab_incharge`
+
+If multiple matching resources are found:
+
+- the bot stores them in state
+- the user is asked to choose one by number
+
+If no physical match is found:
+
+- the schema may still continue using abstract type classification
+- the bot asks for missing information if needed
+
+## 6. Which Fields Are Required
+
+The engine decides the next missing field using `_next_missing_field()`.
+
+Current rules:
+
+- `type` is always required
+- `complaint_description` is required
+- `machine_id` is required only for resource-backed types:
+  - Equipment
+  - Facility
+  - Safety
+  - Process
+- `location_name` is required for:
+  - Equipment
+  - Facility
+  - Safety
+  - Process
+  - HR
+  - IT
+  - Inventory
+
+## 7. Question Flow
+
+The engine asks only one meaningful next question at a time.
+
+Examples:
+
+- unknown type -> asks the user to choose a type
+- resource-backed type with missing machine -> asks which equipment/resource is affected
+- missing location for location-relevant types -> asks where the issue is happening
+
+Question text is generated by `_question_for_field()`.
+
+## 8. Special Multi-Turn States
+
+The chatbot stores state in `conversation_state` using `user_phone`.
+
+Possible active steps include:
+
+- `collecting_info`
+- `select_resource`
+- `select_category`
+- `confirm_location`
+- `confirming`
+
+### `collecting_info`
+
+Used when one field is missing and the bot needs a direct answer.
+
+### `select_resource`
+
+Used when multiple resource records match. The user replies with a number.
+
+### `select_category`
+
+Used when the search finds more than one possible complaint category.
+
+### `confirm_location`
+
+Used when a resource row gives a likely location and the bot wants explicit user confirmation.
+
+### `confirming`
+
+Used after the schema is complete enough to review.
+
+## 9. Confirmation and Editing
+
+Once the required schema fields are present, the bot shows the complaint schema to the user.
+
+The user may then:
+
+- reply `yes` to register
+- reply `no` to cancel
+- send an edit in the format:
+
+```text
+1.new_value
 ```
-*(Any DB configurations are loaded through `app.chatbot.db` & `app.database.py` defaults.)*
+
+Example:
+
+```text
+7.AMAT Lab
+```
+
+This edits `location_name`.
+
+The engine parses edits using `_parse_edit_message()` and applies them using `_apply_schema_edit()`.
+
+For location edits:
+
+- `location_name` is re-resolved through `lab_incharge`
+- `location_id` is updated automatically
+
+For `location_id` edits:
+
+- the corresponding `location_name` is backfilled automatically
+
+## 10. Registration
+
+When the user replies `yes` in confirmation state:
+
+- conversation state is cleared
+- `_register_complaint()` is called
+- `time_of_complaint` is set to `datetime.now()`
+- the complaint is inserted into the `complaint` table
+
+The bot then returns a success message followed by an explicit end marker.
+
+## 11. Cancellation and Reset Behavior
+
+At any time, the user can send:
+
+- `cancel`
+- `reset`
+- `stop`
+- `abort`
+
+This clears the current complaint flow.
+
+The user can also send:
+
+- `undo`
+- `delete`
+- `remove`
+- `revert`
+
+This deletes the latest complaint registered by that `member_id`.
+
+## 12. Current Resource Search Logic
+
+`extractor.py` currently provides:
+
+- `smart_rapidfuzz_search()`
+- `search_resource_candidates()`
+
+The resource tables mapped in `RESOURCE_TABLE_MAP` are:
+
+- type `1` -> `resources`
+- type `2` -> `facility_resources`
+- type `3` -> `safety_device`
+- type `4` -> `resources`
+
+These searches only look at active rows:
+
+- `activation_status = 1` for `resources` and `facility_resources`
+- `isworking = 1` for `safety_device`
+
+## 13. Current Location Resolution Logic
+
+Location mapping currently depends on `lab_incharge`.
+
+`_resolve_lab_location()` returns:
+
+```python
+(location_name, location_id, memberid)
+```
+
+Matching order:
+
+1. exact numeric `locationid`
+2. direct `ilike` match on raw location string
+3. direct `ilike` match on normalized location string
+4. constrained fuzzy match using RapidFuzz
+
+The fuzzy fallback now requires:
+
+- token overlap between query and candidate
+- a minimum score threshold
+
+This reduces false mappings such as unrelated lab names getting selected from short vague text.
+
+## 14. Gemini Usage Policy
+
+Gemini is used to improve extraction and, if needed, classification.
+
+Current design goals:
+
+- do not use Gemini first if deterministic DB logic is enough
+- cache repeated Gemini calls per message
+- back off temporarily when quota is exhausted
+- continue with local logic if Gemini is unavailable
+
+Gemini currently supports:
+
+- extracting important complaint terms
+- extracting short important phrases
+- suggesting resource phrase
+- suggesting location phrase
+- fallback complaint-type classification
+
+## 15. Known Practical Behavior
+
+The current workflow is designed so that:
+
+- resource complaints should try DB search before asking the user extra questions
+- location names should only remain in the schema if they resolve to real `lab_incharge` rows
+- the user should see a reviewable schema before registration
+- the user can edit schema fields before final registration
+
+## 16. Known Limitations
+
+These are current practical limitations of the workflow:
+
+- classification may still be affected by noisy extracted phrases
+- abstract keyword matches can still compete with physical signals in some edge cases
+- Gemini availability depends on quota and environment
+- if the app server is not restarted after code changes, WhatsApp behavior may still reflect older logic
+
+## 17. Summary
+
+The current chatbot workflow is:
+
+1. receive WhatsApp message from Twilio
+2. authenticate user
+3. resume existing complaint flow or start a new one
+4. initialize complaint schema
+5. extract important words and phrases
+6. resolve location from `lab_incharge`
+7. search physical and abstract complaint sources
+8. classify complaint type
+9. fill resource and location fields from database when possible
+10. ask only for missing information
+11. show schema for review
+12. allow confirmation or edit
+13. register complaint
+14. clear state and end conversation

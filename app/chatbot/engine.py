@@ -5,6 +5,8 @@ import re
 import traceback
 from datetime import datetime
 
+from rapidfuzz import fuzz
+
 from app.chatbot import models
 from app.chatbot.classifier import (
     classify_complaint_type,
@@ -81,6 +83,21 @@ def _normalize_location_text(value: str) -> str:
     return " ".join(tokens).strip()
 
 
+def _score_lab_match(query: str, candidate: str) -> float:
+    query_norm = _normalize_location_text(query)
+    candidate_norm = _normalize_location_text(candidate)
+    if not query_norm or not candidate_norm:
+        return 0.0
+    query_tokens = set(query_norm.split())
+    candidate_tokens = set(candidate_norm.split())
+    if query_tokens and not query_tokens.intersection(candidate_tokens):
+        return 0.0
+    return max(
+        fuzz.ratio(query_norm, candidate_norm),
+        fuzz.token_set_ratio(query_norm, candidate_norm),
+    )
+
+
 def _resolve_lab_location(db, location_str):
     try:
         if not location_str:
@@ -112,21 +129,20 @@ def _resolve_lab_location(db, location_str):
             if incharge:
                 return incharge.location, incharge.locationid, incharge.memberid
 
-            query_tokens = set(normalized_location.split())
             best_match = None
-            best_score = 0
+            best_score = 0.0
             for row in db.query(models.LabIncharge).all():
-                row_normalized = _normalize_location_text(row.location or "")
-                row_tokens = set(row_normalized.split())
-                if not row_tokens:
+                row_location = row.location or ""
+                row_normalized = _normalize_location_text(row_location)
+                if not row_normalized:
                     continue
 
-                overlap = len(query_tokens.intersection(row_tokens))
-                if overlap > best_score:
+                score = _score_lab_match(normalized_location, row_location)
+                if score > best_score:
                     best_match = row
-                    best_score = overlap
+                    best_score = score
 
-            if best_match and best_score > 0:
+            if best_match and best_score >= 70.0:
                 return best_match.location, best_match.locationid, best_match.memberid
     except Exception as exc:
         print(f"[ENGINE] Lab lookup failed: {exc}")
@@ -138,6 +154,26 @@ def _merge_schema(schema: dict, extracted: dict) -> dict:
     for key, value in extracted.items():
         if key in schema and value not in (None, "", "null"):
             schema[key] = value
+    return schema
+
+
+def _resolve_schema_location(db, schema: dict, clear_unresolved: bool = False) -> dict:
+    location_name = schema.get("location_name")
+    location_id = schema.get("location_id")
+
+    if location_name:
+        loc_name, loc_id, _ = _resolve_lab_location(db, location_name)
+        if loc_id is not None:
+            schema["location_name"] = loc_name
+            schema["location_id"] = loc_id
+        elif clear_unresolved:
+            schema["location_name"] = None
+            schema["location_id"] = None
+    elif location_id is not None:
+        loc_name, loc_id, _ = _resolve_lab_location(db, location_id)
+        schema["location_name"] = loc_name
+        schema["location_id"] = loc_id
+
     return schema
 
 
@@ -399,6 +435,7 @@ def _prepare_initial_schema(db, member_id: int, message: str):
 
     local_extracted = extract_local_complaint_schema(message, schema["type"])
     schema = _merge_schema(schema, local_extracted)
+    schema = _resolve_schema_location(db, schema)
 
     if not schema.get("complaint_description"):
         schema["complaint_description"] = message
@@ -412,6 +449,7 @@ def _prepare_initial_schema(db, member_id: int, message: str):
         schema, matched_resource, candidates = _enrich_schema_from_db(db, schema, message)
         schema["type"] = classify_complaint_type(message, matched_machine=matched_resource) or schema["type"]
 
+    schema = _resolve_schema_location(db, schema, clear_unresolved=True)
     schema.pop("important_terms", None)
     schema.pop("important_phrases", None)
 
@@ -442,6 +480,7 @@ def _store_selection_state(db, user_phone: str, schema: dict, candidates):
 
 
 def _continue_or_confirm(db, user_phone: str, schema: dict, candidates=None) -> str:
+    schema = _resolve_schema_location(db, schema, clear_unresolved=True)
     rf_cats = schema.get("_rf_categories", [])
     
     if len(rf_cats) > 1 and not schema.get("type"):
