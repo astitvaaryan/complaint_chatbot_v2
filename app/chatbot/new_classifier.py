@@ -82,7 +82,7 @@ _BASE_KEYWORDS: dict[int, list[str]] = {
     2: ["ac", "air conditioning", "hvac", "ahu", "chiller", "dg set", "ups", "generator", "blower", "dehumidifier"],
     3: ["fire", "smoke", "hazard", "safety", "accident", "emergency", "spill", "gas leak", "alarm", "detector"],
     4: ["process", "recipe", "parameter", "wafer", "yield", "sop", "uniformity", "contamination"],
-    5: ["salary", "payroll", "leave", "attendance", "holiday", "hr", "reimbursement", "appraisal", "promotion"],
+    5: ["salary", "payroll", "leave", "attendance", "holiday", "hr", "reimbursement", "appraisal", "promotion", "office", "recruitment", "letter"]
     6: ["laptop", "computer", "printer", "wifi", "internet", "network", "vpn", "email", "password", "software", "login"],
     7: ["purchase", "procurement", "order", "vendor", "supplier", "invoice", "quote", "chemical", "consumable", "spare"],
     8: ["training", "workshop", "course", "seminar", "certification", "orientation", "session"],
