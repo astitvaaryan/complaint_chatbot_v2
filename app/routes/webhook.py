@@ -1,12 +1,16 @@
+import os
 import traceback
 from datetime import datetime
 
-from fastapi import APIRouter, Form, Request
+from fastapi import APIRouter, BackgroundTasks, Form, Request
 from fastapi.responses import Response
+from twilio.rest import Client
 from twilio.twiml.messaging_response import MessagingResponse
 from app.database import get_users_by_mobile, get_user_by_mobile_and_email
 from datetime import datetime
+from app.chatbot.db import SessionLocal
 from app.chatbot.engine import get_chatbot_reply   # top-level: crash on startup if broken
+from app.chatbot.state_manager import get_state
 
 router = APIRouter()
 
@@ -18,6 +22,100 @@ def twiml_response(resp: MessagingResponse) -> Response:
         media_type="text/xml",
         headers={"Content-Type": "text/xml; charset=utf-8"},
     )
+
+
+def _send_async_whatsapp_message(from_number: str, to_number: str, body: str) -> None:
+    """Send the final WhatsApp reply outside the webhook response cycle."""
+    try:
+        account_sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
+        auth_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+        if not account_sid or not auth_token or not from_number or not to_number or not body.strip():
+            return
+
+        client = Client(account_sid, auth_token)
+        client.messages.create(
+            from_=from_number,
+            to=to_number,
+            body=body,
+        )
+    except Exception as exc:
+        print(f"[WEBHOOK] Async Twilio send failed: {exc}")
+
+
+def should_use_processing(message: str, final_message: str) -> bool:
+    """Use loading only for actual complaint processing, not quick control replies."""
+    msg = (message or "").strip().lower()
+    final = (final_message or "").strip().lower()
+
+    if not final:
+        return False
+
+    immediate_commands = {
+        "hi", "hello", "hey", "whoami", "logout",
+        "cancel", "reset", "stop", "abort",
+        "undo", "delete", "remove", "revert",
+        "yes", "no", "y", "n", "ok", "okay", "confirm",
+    }
+    if msg in immediate_commands:
+        return False
+
+    terminal_prefixes = (
+        "current complaint flow canceled.",
+        "complaint registration canceled.",
+        "complaint registered successfully.",
+        "your latest complaint has been deleted.",
+        "no recent complaint was found to delete.",
+        "i reset the previous conversation state.",
+        "sorry, something went wrong.",
+        "something went wrong.",
+    )
+    if final.startswith(terminal_prefixes):
+        return False
+
+    return True
+
+
+def processing_text_for_user(user_phone: str) -> str:
+    """Choose a user-friendly loading message based on conversation stage."""
+    db = SessionLocal()
+    try:
+        state = get_state(db, user_phone)
+        if state is None:
+            return "Processing your complaint..."
+        return "Loading...."
+    except Exception:
+        return "Loading...."
+    finally:
+        db.close()
+
+
+def respond_with_processing(
+    resp: MessagingResponse,
+    background_tasks: BackgroundTasks,
+    from_number: str | None,
+    to_number: str | None,
+    incoming_message: str,
+    final_message: str,
+    processing_text: str,
+) -> Response:
+    """Return an immediate loading message and send the final reply asynchronously."""
+    if from_number and not str(from_number).startswith("whatsapp:"):
+        from_number = f"whatsapp:{from_number}"
+    if to_number and not str(to_number).startswith("whatsapp:"):
+        to_number = f"whatsapp:{to_number}"
+
+    if not should_use_processing(incoming_message, final_message):
+        resp.message(final_message)
+        return twiml_response(resp)
+
+    resp.message(processing_text)
+
+    if from_number and to_number and final_message.strip():
+        background_tasks.add_task(_send_async_whatsapp_message, from_number, to_number, final_message)
+    else:
+        resp.message(final_message)
+
+    return twiml_response(resp)
 
 # ─────────────────────────────────────────────────────────────────
 # In-memory stores
@@ -114,8 +212,10 @@ def _admit_user(mobile: str, user: dict, incoming_msg: str) -> str:
 @router.post("/webhook")
 async def whatsapp_webhook(
     request: Request,
+    background_tasks: BackgroundTasks,
     From: str = Form(...),
     Body: str = Form(...),
+    To: str = Form(""),
 ):
     """
     Twilio calls this endpoint when a WhatsApp message arrives.
@@ -154,8 +254,15 @@ async def whatsapp_webhook(
             )
             return twiml_response(resp)
 
-        resp.message(handle_message(user, incoming_msg))
-        return twiml_response(resp)
+        return respond_with_processing(
+            resp,
+            background_tasks,
+            To,
+            From,
+            incoming_msg,
+            handle_message(user, incoming_msg),
+            processing_text_for_user(mobile),
+        )
 
     # ── PATH 2: Waiting for email verification ────────────────────
     if mobile in pending_email_ver:
@@ -185,8 +292,15 @@ async def whatsapp_webhook(
                 )
                 return twiml_response(resp)
 
-            resp.message(_admit_user(mobile, matched_user, ""))
-            return twiml_response(resp)
+            return respond_with_processing(
+                resp,
+                background_tasks,
+                To,
+                From,
+                incoming_msg,
+                _admit_user(mobile, matched_user, ""),
+                processing_text_for_user(mobile),
+            )
 
         # Wrong email
         attempts_left = MAX_EMAIL_ATTEMPTS - state["attempts"]
@@ -227,8 +341,15 @@ async def whatsapp_webhook(
             )
             return twiml_response(resp)
 
-        resp.message(_admit_user(mobile, user, incoming_msg))
-        return twiml_response(resp)
+        return respond_with_processing(
+            resp,
+            background_tasks,
+            To,
+            From,
+            incoming_msg,
+            _admit_user(mobile, user, incoming_msg),
+            processing_text_for_user(mobile),
+        )
 
     # ── PATH 4: Duplicate phone numbers → email verification ──────
     print(f"[AUTH] Duplicate mobile {mobile} — {len(users)} accounts found. Asking for email.")

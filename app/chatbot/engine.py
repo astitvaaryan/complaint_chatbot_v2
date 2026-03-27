@@ -12,12 +12,14 @@ from app.chatbot.classifier import (
     classify_complaint_type,
     extract_complaint_schema,
     extract_local_complaint_schema,
+    has_physical_lookup_signal,
 )
 from app.chatbot.db import SessionLocal
 from app.chatbot.extractor import RESOURCE_TABLE_MAP, search_resource_candidates, smart_rapidfuzz_search
 from app.chatbot.state_manager import clear_state, get_state, parse_collected_data, upsert_state
 
 TYPE_NAMES = {
+    0: "Miscellaneous",
     1: "Equipment",
     2: "Facility",
     3: "Safety",
@@ -33,7 +35,7 @@ TYPE_NAMES = {
 YES_WORDS = {"yes", "y", "confirm", "ok", "okay"}
 NO_WORDS = {"no", "n", "cancel"}
 RESOURCE_REQUIRED_TYPES = {1, 2, 3, 4}
-LOCATION_RELEVANT_TYPES = {1, 2, 3, 4, 5, 6, 9}
+LOCATION_RELEVANT_TYPES = {0, 1, 2, 3, 4, 5, 6, 9}
 EDITABLE_FIELDS = {
     1: "member_id",
     2: "machine_id",
@@ -47,7 +49,7 @@ EDITABLE_FIELDS = {
 
 # Types that do NOT require a physical machine / location
 # 2=Facility, 3=Safety, 5=HR, 6=IT, etc.
-NON_EQUIPMENT_TYPES = {2, 3, 5, 6, 7, 8, 9, 10}
+NON_EQUIPMENT_TYPES = {0, 2, 3, 5, 6, 7, 8, 9, 10}
 
 
 def _blank_schema() -> dict:
@@ -67,11 +69,22 @@ def _blank_schema() -> dict:
 
 def _resource_label(complaint_type: int | None) -> str:
     return {
+        0: "tool, equipment, or affected item",
         1: "equipment",
         2: "facility resource",
         3: "safety device",
         4: "tool or equipment",
     }.get(complaint_type, "resource")
+
+
+def _fallback_to_misc(schema: dict) -> dict:
+    schema["type"] = 0
+    schema["machine_id"] = None
+    schema["resource_table"] = None
+    schema["_misc_tool_skipped"] = True
+    if not schema.get("resource_name"):
+        schema["resource_name"] = None
+    return schema
 
 
 def _normalize_location_text(value: str) -> str:
@@ -204,6 +217,16 @@ def _resolve_resource_candidates(db, schema: dict, raw_message: str):
     return []
 
 
+def _resolve_misc_resource(db, query: str, location_name: str | None = None):
+    for complaint_type in (1, 2, 3, 4):
+        rows = search_resource_candidates(db, complaint_type, query, location_name)
+        if len(rows) == 1:
+            return complaint_type, rows[0], rows
+        if len(rows) > 1:
+            return complaint_type, None, rows
+    return None, None, []
+
+
 def _apply_matched_resource(db, schema: dict, resource: object) -> dict:
     config = RESOURCE_TABLE_MAP[schema["type"]]
     schema["machine_id"] = getattr(resource, config["id_field"])
@@ -228,6 +251,11 @@ def _apply_matched_resource(db, schema: dict, resource: object) -> dict:
 
 
 def _enrich_schema_from_db(db, schema: dict, raw_message: str):
+    if not has_physical_lookup_signal(raw_message, schema):
+        schema["_rf_candidates"] = {}
+        schema["_rf_categories"] = []
+        return schema, None, []
+
     nouns = []
     r_name = schema.get("resource_name")
     if r_name and str(r_name).strip():
@@ -281,11 +309,14 @@ def _enrich_schema_from_db(db, schema: dict, raw_message: str):
 def _next_missing_field(schema: dict) -> str | None:
     complaint_type = schema.get("type")
 
-    if not complaint_type:
+    if complaint_type is None:
         return "type"
 
     if not schema.get("complaint_description"):
         return "complaint_description"
+
+    if complaint_type == 0 and not schema.get("resource_name") and not schema.get("_misc_tool_skipped"):
+        return "resource_name"
 
     if complaint_type in RESOURCE_REQUIRED_TYPES and not schema.get("machine_id"):
         return "resource_name"
@@ -302,8 +333,10 @@ def _question_for_field(field: str, complaint_type: int | None) -> str:
     if field == "complaint_description":
         return f"I've classified this as a {type_name.lower()} complaint. What exactly is the issue?"
     if field == "type":
-        return "I couldn't confidently identify the complaint type. Reply with one of: Equipment, Facility, Safety, Process, HR, IT, Purchase, Training, Inventory, Admin."
+        return "I couldn't confidently identify the complaint type. Reply with one of: Miscellaneous, Equipment, Facility, Safety, Process, HR, IT, Purchase, Training, Inventory, Admin."
     if field == "resource_name":
+        if complaint_type == 0:
+            return "I couldn't confidently match this issue. If a specific tool or equipment is involved, reply with its name. Otherwise reply 'skip' and I'll register this under Miscellaneous."
         return f"This looks like a {type_name.lower()} complaint. Which {_resource_label(complaint_type)} is affected?"
     if field == "location_name":
         return f"Noted. Where is this {type_name.lower()} issue happening?"
@@ -316,6 +349,7 @@ def _format_candidate_options(candidates) -> str:
         label = getattr(resource, "name", getattr(resource, "device_name", "Unknown"))
         location = getattr(resource, "location", "")
         lines.append(f"{idx}. {label} ({location})")
+    lines.append("0. Miscellaneous / none of these")
     return "\n".join(lines)
 
 
@@ -354,6 +388,9 @@ def _coerce_edited_value(field_name: str, raw_value: str):
 def _parse_type_value(raw_value: str):
     value = raw_value.strip().lower()
     type_map = {
+        "miscellaneous": 0,
+        "misc": 0,
+        "other": 0,
         "equipment": 1,
         "facility": 2,
         "safety": 3,
@@ -430,7 +467,7 @@ def _register_complaint(db, schema: dict) -> str:
 def _prepare_initial_schema(db, member_id: int, message: str):
     schema = _blank_schema()
     schema["member_id"] = member_id
-    schema["type"] = classify_complaint_type(message)
+    schema["type"] = classify_complaint_type(message) or 0
     schema["status"] = "Open"
 
     local_extracted = extract_local_complaint_schema(message, schema["type"])
@@ -483,11 +520,12 @@ def _continue_or_confirm(db, user_phone: str, schema: dict, candidates=None) -> 
     schema = _resolve_schema_location(db, schema, clear_unresolved=True)
     rf_cats = schema.get("_rf_categories", [])
     
-    if len(rf_cats) > 1 and not schema.get("type"):
+    if len(rf_cats) > 1 and schema.get("type") in (None, 0):
         upsert_state(db, user_phone, "select_category", {"schema": schema, "categories": rf_cats})
         lines = ["Which type of issue is it? Reply with the number:"]
         for idx, c in enumerate(rf_cats, start=1):
             lines.append(f"{idx}. {TYPE_NAMES.get(c, 'Unknown')}")
+        lines.append("0. Miscellaneous")
         return "\n".join(lines)
         
     if schema.pop("_require_location_confirm", False):
@@ -505,6 +543,8 @@ def _continue_or_confirm(db, user_phone: str, schema: dict, candidates=None) -> 
     if next_field:
         if next_field == "resource_name" and not schema.get("resource_name"):
             _store_collection_state(db, user_phone, schema, next_field)
+            if complaint_type == 0:
+                return _question_for_field(next_field, complaint_type)
             return "I could not find a specific match for your issue. Please properly describe the equipment or issue again."
         _store_collection_state(db, user_phone, schema, next_field)
         return _question_for_field(next_field, complaint_type)
@@ -519,11 +559,13 @@ def _handle_resource_selection(db, state, message: str, user_phone: str) -> str:
     candidates = data.get("candidates", [])
 
     if not message.strip().isdigit():
-        return "Reply with the number from the list."
+        schema = _fallback_to_misc(schema)
+        return "I couldn't map that selection to a valid tool, so I'm routing this to Miscellaneous.\n\n" + _continue_or_confirm(db, user_phone, schema)
 
     choice = int(message.strip())
-    if choice < 1 or choice > len(candidates):
-        return "That number is not valid. Reply with one of the listed numbers."
+    if choice == 0 or choice < 1 or choice > len(candidates):
+        schema = _fallback_to_misc(schema)
+        return "I couldn't map that selection to a valid tool, so I'm routing this to Miscellaneous.\n\n" + _continue_or_confirm(db, user_phone, schema)
 
     selected = candidates[choice - 1]
     schema["machine_id"] = selected["machine_id"]
@@ -557,7 +599,28 @@ def _handle_collecting_info(db, state, message: str, user_phone: str) -> str:
         schema["location_name"] = loc_name
         schema["location_id"] = loc_id
     elif current_field == "resource_name":
+        if schema.get("type") == 0 and answer.lower() == "skip":
+            schema["resource_name"] = None
+            schema["_misc_tool_skipped"] = True
+            return _continue_or_confirm(db, user_phone, schema)
+
         schema["resource_name"] = answer
+
+        if schema.get("type") == 0:
+            matched_type, matched_resource, candidates = _resolve_misc_resource(
+                db,
+                answer,
+                schema.get("location_name"),
+            )
+            if matched_type and matched_resource:
+                schema["type"] = matched_type
+                schema = _apply_matched_resource(db, schema, matched_resource)
+                return _continue_or_confirm(db, user_phone, schema)
+            if matched_type and len(candidates) > 1:
+                schema["type"] = matched_type
+                return _continue_or_confirm(db, user_phone, schema, candidates)
+            return _continue_or_confirm(db, user_phone, schema)
+
         candidates = _resolve_resource_candidates(db, schema, answer)
 
         if len(candidates) == 1:
@@ -605,11 +668,13 @@ def _handle_category_selection(db, state, message: str, user_phone: str) -> str:
     categories = data.get("categories", [])
     
     if not message.strip().isdigit():
-        return "Reply with the number from the list."
+        schema = _fallback_to_misc(schema)
+        return "I couldn't map that selection to a valid category, so I'm routing this to Miscellaneous.\n\n" + _continue_or_confirm(db, user_phone, schema)
         
     choice = int(message.strip())
-    if choice < 1 or choice > len(categories):
-        return "That number is not valid. Reply with one of the listed numbers."
+    if choice == 0 or choice < 1 or choice > len(categories):
+        schema = _fallback_to_misc(schema)
+        return "I couldn't map that selection to a valid category, so I'm routing this to Miscellaneous.\n\n" + _continue_or_confirm(db, user_phone, schema)
         
     selected_cat = categories[choice - 1]
     schema["type"] = selected_cat

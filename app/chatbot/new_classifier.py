@@ -28,6 +28,7 @@ from app.chatbot.extractor import search_resource_candidates
 load_dotenv()
 
 TYPE_NAMES = {
+    0: "Miscellaneous",
     1: "Equipment",
     2: "Facility",
     3: "Safety",
@@ -42,6 +43,10 @@ TYPE_NAMES = {
 VALID_TYPES = set(TYPE_NAMES.keys())
 
 TYPE_NAME_TO_ID = {
+    "miscellaneous": 0,
+    "misc": 0,
+    "other": 0,
+    "unknown": 0,
     "equipment": 1,
     "facility": 2,
     "safety": 3,
@@ -52,7 +57,6 @@ TYPE_NAME_TO_ID = {
     "training": 8,
     "inventory": 9,
     "admin": 10,
-    "unknown": None,
 }
 
 CATEGORY_TYPE_MAP: dict[str, int] = {
@@ -102,6 +106,17 @@ GENERIC_RESOURCE_TERMS = {
     "issue", "problem", "complaint", "equipment", "machine", "device", "resource",
     "tool", "system", "lab", "room", "area",
 }
+PHYSICAL_SIGNAL_TERMS = {
+    "equipment", "instrument", "device", "tool", "machine", "hardware",
+    "facility", "resource", "tv", "screen", "monitor", "microscope", "printer",
+    "furnace", "oven", "reactor",
+    "ups", "ahu", "chiller", "generator", "blower", "detector", "alarm", "sensor",
+    "wafer", "process", "recipe", "chamber", "pump", "valve", "gas", "leak",
+    "lithography", "etch", "deposition", "cmp",
+}
+ABSTRACT_SIGNAL_TYPES = (5, 6, 7, 8, 9, 10)
+RESOURCE_TOKEN_SET: set[str] = set()
+RESOURCE_PHRASE_SET: set[str] = set()
 
 _gemini_client = None
 GEMINI_MODEL = "gemini-2.5-flash"
@@ -147,6 +162,52 @@ def _dedupe_preserve_order(items: list[str]) -> list[str]:
         seen.add(cleaned)
         result.append(cleaned)
     return result
+
+
+def _tokenize_simple(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", str(text).lower())
+
+
+def _build_resource_phrases(tokens: list[str]) -> set[str]:
+    phrases = set()
+    for size in (3, 2):
+        for idx in range(len(tokens) - size + 1):
+            phrase = " ".join(tokens[idx:idx + size]).strip()
+            if phrase:
+                phrases.add(phrase)
+    return phrases
+
+
+def _load_physical_lookup_vocabulary() -> None:
+    global RESOURCE_TOKEN_SET, RESOURCE_PHRASE_SET
+    if RESOURCE_TOKEN_SET or RESOURCE_PHRASE_SET:
+        return
+
+    db = SessionLocal()
+    try:
+        sources = [
+            db.query(models.EqpProcessResource.name).filter(models.EqpProcessResource.activation_status == 1).all(),
+            db.query(models.FacilityResource.name).filter(models.FacilityResource.activation_status == 1).all(),
+            db.query(models.SafetyDevice.device_name).filter(models.SafetyDevice.isworking == 1).all(),
+        ]
+
+        token_set = set()
+        phrase_set = set()
+        for rows in sources:
+            for row in rows:
+                value = row[0]
+                if not value:
+                    continue
+                tokens = [t for t in _tokenize_simple(value) if len(t) > 1 and t not in LOCAL_STOP_WORDS]
+                token_set.update(tokens)
+                phrase_set.update(_build_resource_phrases(tokens))
+
+        RESOURCE_TOKEN_SET = token_set
+        RESOURCE_PHRASE_SET = phrase_set
+    except Exception as exc:
+        print(f"[CLASSIFIER] Physical vocabulary load failed: {exc}")
+    finally:
+        db.close()
 
 
 def _nltk_stop_words() -> set[str]:
@@ -298,6 +359,65 @@ def _best_resource_phrase(terms: list[str]) -> str | None:
     return None
 
 
+def _has_hard_physical_marker(text: str) -> bool:
+    text_lower = str(text).lower()
+    tokens = set(re.findall(r"[a-z0-9]+", text_lower))
+    if tokens.intersection(PHYSICAL_SIGNAL_TERMS):
+        return True
+    if re.search(r"\b[a-z]{2,}\d+\b|\b\d+[a-z]{2,}\b", text_lower):
+        return True
+    if re.search(r"\b[A-Z]{2,}[A-Z0-9\s\-_/]{2,}\b", str(text)):
+        return True
+    return False
+
+
+def _has_explicit_physical_marker(text: str) -> bool:
+    _load_physical_lookup_vocabulary()
+    text_lower = str(text).lower()
+    filtered_tokens = {t for t in _tokenize_simple(text_lower) if len(t) > 1 and t not in LOCAL_STOP_WORDS}
+    phrases = _build_resource_phrases([t for t in _tokenize_simple(text_lower) if len(t) > 1 and t not in LOCAL_STOP_WORDS])
+
+    if filtered_tokens.intersection(RESOURCE_TOKEN_SET):
+        return True
+    if phrases.intersection(RESOURCE_PHRASE_SET):
+        return True
+    return _has_hard_physical_marker(text)
+
+
+def _has_strong_abstract_marker(message: str) -> bool:
+    message_lower = message.lower()
+    for complaint_type in ABSTRACT_SIGNAL_TYPES:
+        for keyword in _BASE_KEYWORDS.get(complaint_type, []):
+            if re.search(r"\b" + re.escape(keyword) + r"\b", message_lower):
+                return True
+    if _match_it_keywords(message):
+        return True
+    return False
+
+
+def has_physical_lookup_signal(message: str, local_schema: dict | None = None) -> bool:
+    schema = local_schema or extract_local_complaint_schema(message)
+
+    if _has_strong_abstract_marker(message) and not _has_hard_physical_marker(message):
+        return False
+
+    resource_name = schema.get("resource_name")
+    if resource_name and _has_explicit_physical_marker(resource_name):
+        return True
+
+    searchable = []
+    searchable.extend(schema.get("important_terms", []))
+    searchable.extend(schema.get("important_phrases", [])[:8])
+
+    for item in searchable:
+        if _has_explicit_physical_marker(item):
+            return True
+
+    if _has_explicit_physical_marker(message):
+        return True
+    return False
+
+
 def extract_local_complaint_schema(message: str, complaint_type: int | None = None) -> dict:
     words = preprocess(message)
     words = normalize(words)
@@ -323,6 +443,8 @@ def extract_local_complaint_schema(message: str, complaint_type: int | None = No
         resource_name = gemini_extracted.get("resource_name")
     if not resource_name:
         resource_name = _best_resource_phrase(resource_keywords)
+    if complaint_type == 0 and resource_name and not _has_explicit_physical_marker(resource_name):
+        resource_name = None
     if complaint_type in {5, 6, 7, 8, 9, 10}:
         resource_name = None
 
@@ -377,6 +499,8 @@ def _detect_type_from_tables(message: str) -> Optional[int]:
     db = SessionLocal()
     try:
         local_schema = extract_local_complaint_schema(message)
+        if not has_physical_lookup_signal(message, local_schema):
+            return None
         lookup_candidates = []
         if local_schema["resource_name"]:
             lookup_candidates.append(local_schema["resource_name"])
@@ -476,6 +600,7 @@ def _gemini_classify(message: str) -> Optional[int]:
         prompt = f"""You are classifying a workplace / lab complaint message.
 
 Reply with ONLY one number:
+0=Miscellaneous
 1=Equipment
 2=Facility
 3=Safety
@@ -487,7 +612,7 @@ Reply with ONLY one number:
 9=Inventory
 10=Admin
 
-If unclear, reply UNCLEAR.
+If the complaint is unclear, generic, or cannot be confidently matched, reply 0.
 
 Message: "{message}"
 Reply:"""
@@ -495,7 +620,7 @@ Reply:"""
         response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
         result = response.text.strip()
         if result.upper() == "UNCLEAR":
-            return None
+            return 0
         type_num = int(result)
         return type_num if type_num in VALID_TYPES else None
     except Exception as exc:
@@ -538,10 +663,10 @@ def classify_complaint_type(message: str, matched_machine=None) -> Optional[int]
         return gemini_type
 
     if tied_types:
-        for preferred in [6, 3, 2, 4, 5, 7, 8, 9, 10, 1]:
+        for preferred in [6, 3, 2, 4, 5, 7, 8, 9, 10, 1, 0]:
             if preferred in tied_types:
                 return preferred
-    return None
+    return 0
 
 
 def extract_complaint_schema(message: str, complaint_type: int | None = None) -> dict:
