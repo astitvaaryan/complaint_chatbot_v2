@@ -35,11 +35,17 @@ TYPE_NAMES = {
 YES_WORDS = {"yes", "y", "confirm", "ok", "okay"}
 NO_WORDS = {"no", "n", "cancel"}
 RESOURCE_REQUIRED_TYPES = {1, 2, 3, 4}
-LOCATION_RELEVANT_TYPES = {0, 1, 2, 3, 4, 5, 6, 9}
-EDITABLE_FIELDS = {
-    1: "type",
-    2: "resource_name",
-}
+LOCATION_RELEVANT_TYPES = {0, 1, 2, 3, 4, 9}
+
+def _get_editable_fields(schema: dict) -> dict:
+    fields = {1: "type"}
+    idx = 2
+    if schema.get("type", 0) in RESOURCE_REQUIRED_TYPES:
+        fields[idx] = "resource_name"
+        idx += 1
+    if schema.get("location_name"):
+        fields[idx] = "location_name"
+    return fields
 
 # Types that do NOT require a physical machine / location
 # 2=Facility, 3=Safety, 5=HR, 6=IT, etc.
@@ -76,6 +82,7 @@ def _fallback_to_misc(schema: dict) -> dict:
     schema["machine_id"] = None
     schema["resource_table"] = None
     schema["_misc_tool_skipped"] = True
+    schema["_rf_candidates"] = {}
     if not schema.get("resource_name"):
         schema["resource_name"] = None
     return schema
@@ -351,27 +358,50 @@ def _render_schema(schema: dict) -> str:
     type_id = schema.get("type", 0)
     type_name = TYPE_NAMES.get(type_id, "Miscellaneous")
     tool_name = schema.get("resource_name") or (schema.get("machine_id", "Miscellaneous") if schema.get("machine_id") else "Miscellaneous")
+    loc_name = schema.get("location_name")
+    
+    fields = _get_editable_fields(schema)
     
     lines = [
         f"• Description: {schema.get('complaint_description', 'N/A')}",
-        f"• Location: {schema.get('location_name', 'N/A')}",
+        f"• Location: {loc_name or 'N/A'}",
         "",
-        "If you want to make changes, send an edit:",
-        f"1. Type: {type_name}"
+        "If you want to make changes, send an edit:"
     ]
     
-    if type_id in RESOURCE_REQUIRED_TYPES:
-        lines.append(f"2. Tool: {tool_name}")
-        
+    for num, field in fields.items():
+        if field == "type":
+            lines.append(f"{num}. Type: {type_name}")
+        elif field == "resource_name":
+            lines.append(f"{num}. Tool: {tool_name}")
+        elif field == "location_name":
+            lines.append(f"{num}. Location: {loc_name}")
+            
     return "\n".join(lines)
 
 def _show_confirmation(schema: dict) -> str:
     type_id = schema.get("type", 0)
-    edit_example = "'1. Equipment' or '2. AC'" if type_id in RESOURCE_REQUIRED_TYPES else "'1. HR'"
+    type_name = TYPE_NAMES.get(type_id, "Miscellaneous")
+    
+    fields = _get_editable_fields(schema)
+    examples = []
+    for num, field in fields.items():
+        if field == "type":
+            examples.append(f"'{num}. Equipment'")
+        elif field == "resource_name":
+            examples.append(f"'{num}. SEM Tool'")
+        elif field == "location_name":
+            examples.append(f"'{num}. Reception'")
+
+    if len(examples) <= 2:
+        example_str = " or ".join(examples)
+    else:
+        example_str = ", ".join(examples[:-1]) + f", or {examples[-1]}"
     
     return (
+        f"I've mapped this as a '{type_name}' complaint.\n\n"
         f"Please confirm your final complaint details:\n\n{_render_schema(schema)}\n\n"
-        f"Reply 'yes' to proceed, 'no' to cancel, or send an edit (e.g. {edit_example})."
+        f"Reply 'yes' to proceed, 'no' to cancel, or send an edit by typing the list number and the new text (e.g. {example_str})."
     )
 
 
@@ -416,7 +446,10 @@ def _parse_type_value(raw_value: str):
 
 
 def _apply_schema_edit(db, schema: dict, field_number: int, raw_value: str) -> dict:
-    field_name = EDITABLE_FIELDS[field_number]
+    fields = _get_editable_fields(schema)
+    field_name = fields.get(field_number)
+    if not field_name: return schema
+    
     value = _coerce_edited_value(field_name, raw_value)
     schema[field_name] = value
 
@@ -432,13 +465,15 @@ def _apply_schema_edit(db, schema: dict, field_number: int, raw_value: str) -> d
     return schema
 
 
-def _parse_edit_message(message: str):
+def _parse_edit_message(message: str, schema: dict):
     match = re.match(r"^\s*(\d+)\.(.+?)\s*$", message, re.DOTALL)
     if not match:
         return None, None
     field_number = int(match.group(1))
     field_value = match.group(2).strip()
-    if field_number not in EDITABLE_FIELDS:
+    
+    fields = _get_editable_fields(schema)
+    if field_number not in fields:
         return None, None
     return field_number, field_value
 
@@ -564,12 +599,12 @@ def _handle_resource_selection(db, state, message: str, user_phone: str) -> str:
 
     if not message.strip().isdigit():
         schema = _fallback_to_misc(schema)
-        return "I couldn't map that selection to a valid tool, so I'm routing this to Miscellaneous.\n\n" + _continue_or_confirm(db, user_phone, schema)
+        return "Okay, skipping the tool selection.\n\n" + _continue_or_confirm(db, user_phone, schema)
 
     choice = int(message.strip())
     if choice == 0 or choice < 1 or choice > len(candidates):
         schema = _fallback_to_misc(schema)
-        return "I couldn't map that selection to a valid tool, so I'm routing this to Miscellaneous.\n\n" + _continue_or_confirm(db, user_phone, schema)
+        return "Okay, skipping the tool selection.\n\n" + _continue_or_confirm(db, user_phone, schema)
 
     selected = candidates[choice - 1]
     schema["machine_id"] = selected["machine_id"]
@@ -650,8 +685,10 @@ def _handle_confirmation(db, state, message: str, user_phone: str) -> str:
         clear_state(db, user_phone)
         return "Complaint registration canceled."
 
-    field_number, field_value = _parse_edit_message(message)
+    field_number, field_value = _parse_edit_message(message, schema)
     if field_number is not None:
+        original_fields = _get_editable_fields(schema)
+        field_name = original_fields.get(field_number, "field")
         try:
             schema = _apply_schema_edit(db, schema, field_number, field_value)
         except ValueError:
@@ -659,7 +696,7 @@ def _handle_confirmation(db, state, message: str, user_phone: str) -> str:
 
         upsert_state(db, user_phone, "confirming", {"schema": schema})
         return (
-            f"Updated {EDITABLE_FIELDS[field_number]}.\n\n"
+            f"Updated {field_name.replace('_', ' ').capitalize()}.\n\n"
             f"{_show_confirmation(schema)}"
         )
 

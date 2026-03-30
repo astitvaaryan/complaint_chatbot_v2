@@ -1,4 +1,5 @@
 import os
+import pickle
 import traceback
 from datetime import datetime
 
@@ -100,17 +101,28 @@ def respond_with_processing(
     return twiml_response(resp)
 
 # ─────────────────────────────────────────────────────────────────
-# In-memory stores
-#
-# sessions          → key: mobile  | value: fully authenticated user dict
-# pending_email_ver → key: mobile  | value: {"candidates": [user, …], "attempts": int}
-#
-# pending_email_ver holds numbers where the same phone belongs to
-# multiple accounts.  The user must reply with their registered email
-# to resolve which account to authenticate.
-# ─────────────────────────────────────────────────────────────────
 sessions:          dict = {}
 pending_email_ver: dict = {}
+
+SESSION_FILE = "sessions.pkl"
+
+def _load_sessions():
+    global sessions
+    if os.path.exists(SESSION_FILE):
+        try:
+            with open(SESSION_FILE, "rb") as f:
+                sessions = pickle.load(f)
+        except Exception:
+            pass
+
+def _save_sessions():
+    try:
+        with open(SESSION_FILE, "wb") as f:
+            pickle.dump(sessions, f)
+    except Exception:
+        pass
+
+_load_sessions()
 
 MAX_EMAIL_ATTEMPTS = 3   # lock out after this many wrong emails
 
@@ -177,6 +189,7 @@ def _admit_user(mobile: str, user: dict, incoming_msg: str) -> str:
     Called once authentication is complete (either path).
     """
     sessions[mobile] = user
+    _save_sessions()
     print(f"✅ Logged in: {user['fname']} {user['lname']} ({user['position']})")
 
     msg_lower = incoming_msg.lower().strip()
@@ -224,12 +237,14 @@ async def whatsapp_webhook(
         # Explicit Logout Command
         if incoming_msg.lower().strip() == "logout":
             del sessions[mobile]
+            _save_sessions()
             resp.message("👋 You have been logged out successfully. You will be asked to authenticate again on your next message.")
             return twiml_response(resp)
 
         # Continual Expiry Check (Ensure they weren't removed while in-session)
         if is_account_expired(user.get("expiry_date", "")):
             del sessions[mobile]
+            _save_sessions()
             resp.message(
                 f"Hi {user['fname']}! Your account expired on {user.get('expiry_date', 'unknown')}. "
                 f"Please reach out to the administrator to renew access. 🙏"
