@@ -37,14 +37,8 @@ NO_WORDS = {"no", "n", "cancel"}
 RESOURCE_REQUIRED_TYPES = {1, 2, 3, 4}
 LOCATION_RELEVANT_TYPES = {0, 1, 2, 3, 4, 5, 6, 9}
 EDITABLE_FIELDS = {
-    1: "member_id",
-    2: "machine_id",
-    3: "complaint_description",
-    4: "type",
-    5: "status",
-    6: "time_of_complaint",
-    7: "location_name",
-    8: "location_id",
+    1: "type",
+    2: "resource_name",
 }
 
 # Types that do NOT require a physical machine / location
@@ -354,20 +348,30 @@ def _format_candidate_options(candidates) -> str:
 
 
 def _render_schema(schema: dict) -> str:
-    lines = ["{"]
-    for index, field_name in EDITABLE_FIELDS.items():
-        value = schema.get(field_name)
-        rendered = json.dumps(value, default=str)
-        lines.append(f'  "{index}.{field_name}": {rendered},')
-    lines[-1] = lines[-1].rstrip(",")
-    lines.append("}")
+    type_id = schema.get("type", 0)
+    type_name = TYPE_NAMES.get(type_id, "Miscellaneous")
+    tool_name = schema.get("resource_name") or (schema.get("machine_id", "Miscellaneous") if schema.get("machine_id") else "Miscellaneous")
+    
+    lines = [
+        f"• Description: {schema.get('complaint_description', 'N/A')}",
+        f"• Location: {schema.get('location_name', 'N/A')}",
+        "",
+        "If you want to make changes, send an edit:",
+        f"1. Type: {type_name}"
+    ]
+    
+    if type_id in RESOURCE_REQUIRED_TYPES:
+        lines.append(f"2. Tool: {tool_name}")
+        
     return "\n".join(lines)
 
-
 def _show_confirmation(schema: dict) -> str:
+    type_id = schema.get("type", 0)
+    edit_example = "'1. Equipment' or '2. AC'" if type_id in RESOURCE_REQUIRED_TYPES else "'1. HR'"
+    
     return (
-        f"Please confirm this complaint schema:\n{_render_schema(schema)}\n\n"
-        "Reply 'yes' to register, 'no' to cancel, or send an edit like '1.new_value'."
+        f"Please confirm your final complaint details:\n\n{_render_schema(schema)}\n\n"
+        f"Reply 'yes' to proceed, 'no' to cancel, or send an edit (e.g. {edit_example})."
     )
 
 

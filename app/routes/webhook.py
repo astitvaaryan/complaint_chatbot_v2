@@ -42,14 +42,12 @@ def _send_async_whatsapp_message(from_number: str, to_number: str, body: str) ->
         print(f"[WEBHOOK] Async Twilio send failed: {exc}")
 
 
-def should_use_processing(message: str, final_message: str) -> bool:
-    """Use loading only for actual complaint processing, not quick control replies."""
+def is_quick_reply(message: str) -> bool:
+    """Check if the message should bypass the loading indicator and process synchronously."""
     msg = (message or "").strip().lower()
-    final = (final_message or "").strip().lower()
-
-    if not final:
-        return False
-
+    if not msg:
+        return True
+        
     immediate_commands = {
         "hi", "hello", "hey", "whoami", "logout",
         "cancel", "reset", "stop", "abort",
@@ -57,37 +55,30 @@ def should_use_processing(message: str, final_message: str) -> bool:
         "yes", "no", "y", "n", "ok", "okay", "confirm",
     }
     if msg in immediate_commands:
-        return False
-
-    terminal_prefixes = (
-        "current complaint flow canceled.",
-        "complaint registration canceled.",
-        "complaint registered successfully.",
-        "your latest complaint has been deleted.",
-        "no recent complaint was found to delete.",
-        "i reset the previous conversation state.",
-        "sorry, something went wrong.",
-        "something went wrong.",
-    )
-    if final.startswith(terminal_prefixes):
-        return False
-
-    return True
+        return True
+        
+    # Fast path for edit inputs like '1. Equipment' or '2. AC'
+    if len(msg) > 0 and msg[0].isdigit() and "." in msg:
+        return True
+        
+    return False
 
 
 def processing_text_for_user(user_phone: str) -> str:
     """Choose a user-friendly loading message based on conversation stage."""
-    db = SessionLocal()
-    try:
-        state = get_state(db, user_phone)
-        if state is None:
-            return "Processing your complaint..."
-        return "Loading...."
-    except Exception:
-        return "Loading...."
-    finally:
-        db.close()
+    return "Loading...."
 
+
+def _run_and_send_async(from_number: str, to_number: str, func, *args):
+    try:
+        final_message = func(*args)
+        if from_number and not str(from_number).startswith("whatsapp:"):
+            from_number = f"whatsapp:{from_number}"
+        if to_number and not str(to_number).startswith("whatsapp:"):
+            to_number = f"whatsapp:{to_number}"
+        _send_async_whatsapp_message(from_number, to_number, final_message)
+    except Exception as exc:
+        print(f"[WEBHOOK] Async error: {exc}")
 
 def respond_with_processing(
     resp: MessagingResponse,
@@ -95,26 +86,17 @@ def respond_with_processing(
     from_number: str | None,
     to_number: str | None,
     incoming_message: str,
-    final_message: str,
     processing_text: str,
+    func, *args
 ) -> Response:
-    """Return an immediate loading message and send the final reply asynchronously."""
-    if from_number and not str(from_number).startswith("whatsapp:"):
-        from_number = f"whatsapp:{from_number}"
-    if to_number and not str(to_number).startswith("whatsapp:"):
-        to_number = f"whatsapp:{to_number}"
-
-    if not should_use_processing(incoming_message, final_message):
-        resp.message(final_message)
+    """Evaluate immediately for quick replies, otherwise return Loading and queue background task."""
+    if is_quick_reply(incoming_message):
+        resp.message(func(*args))
         return twiml_response(resp)
 
     resp.message(processing_text)
-
-    if from_number and to_number and final_message.strip():
-        background_tasks.add_task(_send_async_whatsapp_message, from_number, to_number, final_message)
-    else:
-        resp.message(final_message)
-
+    if from_number and to_number:
+        background_tasks.add_task(_run_and_send_async, from_number, to_number, func, *args)
     return twiml_response(resp)
 
 # ─────────────────────────────────────────────────────────────────
@@ -260,8 +242,8 @@ async def whatsapp_webhook(
             To,
             From,
             incoming_msg,
-            handle_message(user, incoming_msg),
             processing_text_for_user(mobile),
+            handle_message, user, incoming_msg
         )
 
     # ── PATH 2: Waiting for email verification ────────────────────
@@ -298,8 +280,8 @@ async def whatsapp_webhook(
                 To,
                 From,
                 incoming_msg,
-                _admit_user(mobile, matched_user, ""),
                 processing_text_for_user(mobile),
+                _admit_user, mobile, matched_user, ""
             )
 
         # Wrong email
@@ -347,8 +329,8 @@ async def whatsapp_webhook(
             To,
             From,
             incoming_msg,
-            _admit_user(mobile, user, incoming_msg),
             processing_text_for_user(mobile),
+            _admit_user, mobile, user, incoming_msg
         )
 
     # ── PATH 4: Duplicate phone numbers → email verification ──────
