@@ -87,7 +87,7 @@ _BASE_KEYWORDS: dict[int, list[str]] = {
     3: ["fire", "smoke", "hazard", "safety", "accident", "emergency", "spill", "gas leak", "alarm", "detector"],
     4: ["process", "recipe", "parameter", "wafer", "yield", "sop", "uniformity", "contamination"],
     5: ["salary", "payroll", "leave", "attendance", "holiday", "hr", "reimbursement", "appraisal", "promotion", "office", "recruitment", "letter"],
-    6: ["laptop", "computer", "printer", "wifi", "internet", "network", "vpn", "email", "password", "software", "login"],
+    6: ["laptop", "computer", "printer", "wifi", "internet", "network", "vpn", "email", "password", "software", "login", "usb", "mouse", "keyboard"],
     7: ["purchase", "procurement", "order", "vendor", "supplier", "invoice", "quote", "chemical", "consumable", "spare"],
     8: ["training", "workshop", "course", "seminar", "certification", "orientation", "session"],
     9: ["inventory", "stock", "missing item", "spare parts", "shortage", "out of stock", "reorder", "asset"],
@@ -186,8 +186,14 @@ def _load_physical_lookup_vocabulary() -> None:
     db = SessionLocal()
     try:
         sources = [
-            db.query(models.EqpProcessResource.name).filter(models.EqpProcessResource.activation_status == 1).all(),
-            db.query(models.FacilityResource.name).filter(models.FacilityResource.activation_status == 1).all(),
+            db.query(models.EqpProcessResource.name).filter(
+                models.EqpProcessResource.activation_status == 1,
+                models.EqpProcessResource.display != 3
+            ).all(),
+            db.query(models.FacilityResource.name).filter(
+                models.FacilityResource.activation_status == 1,
+                models.FacilityResource.display != 3
+            ).all(),
             db.query(models.SafetyDevice.device_name).filter(models.SafetyDevice.isworking == 1).all(),
         ]
 

@@ -459,7 +459,7 @@ def _parse_edit_message(message: str, schema: dict):
 
 
 def _register_complaint(db, schema: dict) -> str:
-    schema["status"] = 1  # 1 for Open / Unresolved
+    schema["status"] = 0  # 0 = Pending
     schema["time_of_complaint"] = datetime.now()
 
     complaint = models.Complaint(
@@ -484,7 +484,7 @@ def _prepare_initial_schema(db, member_id: int, message: str):
     schema = _blank_schema()
     schema["member_id"] = member_id
     schema["type"] = classify_complaint_type(message) or 0
-    schema["status"] = "Open"
+    schema["status"] = 0  # 0 = Pending
 
     local_extracted = extract_local_complaint_schema(message, schema["type"])
     schema = _merge_schema(schema, local_extracted)
@@ -791,9 +791,6 @@ def get_chatbot_reply(user: dict, message: str) -> str:
 
     db = SessionLocal()
     try:
-        if msg_lower == "trigger_crash_test":
-            raise ValueError("Administrator manual system crash diagnostic sequence successfully intercepted.")
-
         if msg_lower in {"cancel", "reset", "stop", "abort"}:
             clear_state(db, user_phone)
             return "Current complaint flow canceled."

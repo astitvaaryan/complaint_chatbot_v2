@@ -1,9 +1,9 @@
 # IITBNF WhatsApp Chatbot Production Deployment Guide
 
 ## 1. Codebase Transfer
-To pull the physical application architecture securely onto the server, physically navigate to your web root and clone the repository:
+To pull the physical application architecture securely onto the server, physically navigate to your web root and clone out the specific production branch:
 ```bash
-git clone [YOUR_REPO_URL]
+git clone -b bala-schema-update [YOUR_REPO_URL]
 cd bala-chatbot
 ```
 

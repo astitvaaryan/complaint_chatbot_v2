@@ -19,7 +19,7 @@ from app.chatbot.db import Base
 
 
 class EqpProcessResource(Base):
-    __tablename__ = "eqp-process_resources"
+    __tablename__ = "resources"
     __table_args__ = {"schema": "slotbooking", "extend_existing": True}
 
     machid = Column(Integer, primary_key=True, index=True)
@@ -28,6 +28,7 @@ class EqpProcessResource(Base):
     activation_status = Column(Integer)
     isworking = Column(Integer, default=1)
     category = Column(String(50))
+    display = Column(Integer, nullable=True)
 
 
 class FacilityResource(Base):
@@ -39,11 +40,12 @@ class FacilityResource(Base):
     location = Column(String(250))
     activation_status = Column(Integer)
     category = Column(String(50))
+    display = Column(Integer, nullable=True)
 
 
 class SafetyDevice(Base):
-    __tablename__ = "safety_device"
-    __table_args__ = {"schema": "safety", "extend_existing": True}
+    __tablename__ = "resources"
+    __table_args__ = {"schema": "safety_device", "extend_existing": True}
 
     device_id = Column(Integer, primary_key=True, index=True)
     device_name = Column(String(200))
@@ -64,19 +66,20 @@ class LabIncharge(Base):
 
 class Complaint(Base):
     __tablename__ = "equipment_complaint"
-    __table_args__ = {"extend_existing": True}
+    __table_args__ = {"schema": "iitbnf_troubleshoot", "extend_existing": True}
 
     complaint_id = Column(Integer, primary_key=True, index=True)
     member_id = Column(Integer)
     machine_id = Column(Integer, nullable=True)
     complaint_description = Column(Text, nullable=False)
     time_of_complaint = Column(DateTime(timezone=True), server_default=func.now())
-    status = Column(Integer, default=1)
+    status = Column(Integer, default=0)  # 0=Pending, 1=In Process, 2=Closed, 3=On Hold
     type = Column(Integer, nullable=False)
 
 
 class ConversationState(Base):
     __tablename__ = "conversation_state"
+    __table_args__ = {"schema": "iitbnf_troubleshoot", "extend_existing": True}
 
     id = Column(Integer, primary_key=True, index=True)
     user_phone = Column(String(40), unique=True, index=True, nullable=False)
@@ -87,6 +90,7 @@ class ConversationState(Base):
 class ComplaintKeyword(Base):
     """Keywords specifically for IT routing accuracy."""
     __tablename__ = "complaint_it_keywords"
+    __table_args__ = {"schema": "iitbnf_troubleshoot", "extend_existing": True}
 
     id = Column(Integer, primary_key=True, index=True)
     keyword = Column(String(100), unique=True, index=True, nullable=False)
@@ -96,6 +100,7 @@ class ComplaintKeyword(Base):
 class ChatbotErrorLog(Base):
     """Tracks backend exceptions and crashes for IT telemetry."""
     __tablename__ = "chatbot_error_logs"
+    __table_args__ = {"schema": "iitbnf_troubleshoot", "extend_existing": True}
 
     id = Column(Integer, primary_key=True, index=True)
     user_phone = Column(String(40), index=True, nullable=True)

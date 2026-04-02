@@ -82,7 +82,10 @@ def _tier1_physical_search(db, nouns: List[str]) -> Dict[int, List[object]]:
             model = config["model"]
             active_field = getattr(model, config["active_field"])
             
-            rows = db.query(model).filter(active_field == config["active_value"]).all()
+            q = db.query(model).filter(active_field == config["active_value"])
+            if type_id in [1, 2, 4]:
+                q = q.filter(model.display != 3)
+            rows = q.all()
             
             for row in rows:
                 name_val = getattr(row, config["name_field"], "")
