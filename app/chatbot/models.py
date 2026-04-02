@@ -66,7 +66,7 @@ class LabIncharge(Base):
 
 class Complaint(Base):
     __tablename__ = "equipment_complaint"
-    __table_args__ = {"schema": "iitbnf_troubleshoot", "extend_existing": True}
+    __table_args__ = {"schema": "iitbnf_troubleshooting", "extend_existing": True}
 
     complaint_id = Column(Integer, primary_key=True, index=True)
     member_id = Column(Integer)
@@ -79,7 +79,7 @@ class Complaint(Base):
 
 class ConversationState(Base):
     __tablename__ = "conversation_state"
-    __table_args__ = {"schema": "iitbnf_troubleshoot", "extend_existing": True}
+    __table_args__ = {"schema": "iitbnf_troubleshooting", "extend_existing": True}
 
     id = Column(Integer, primary_key=True, index=True)
     user_phone = Column(String(40), unique=True, index=True, nullable=False)
@@ -90,7 +90,7 @@ class ConversationState(Base):
 class ComplaintKeyword(Base):
     """Keywords specifically for IT routing accuracy."""
     __tablename__ = "complaint_it_keywords"
-    __table_args__ = {"schema": "iitbnf_troubleshoot", "extend_existing": True}
+    __table_args__ = {"schema": "iitbnf_troubleshooting", "extend_existing": True}
 
     id = Column(Integer, primary_key=True, index=True)
     keyword = Column(String(100), unique=True, index=True, nullable=False)
@@ -100,7 +100,7 @@ class ComplaintKeyword(Base):
 class ChatbotErrorLog(Base):
     """Tracks backend exceptions and crashes for IT telemetry."""
     __tablename__ = "chatbot_error_logs"
-    __table_args__ = {"schema": "iitbnf_troubleshoot", "extend_existing": True}
+    __table_args__ = {"schema": "iitbnf_troubleshooting", "extend_existing": True}
 
     id = Column(Integer, primary_key=True, index=True)
     user_phone = Column(String(40), index=True, nullable=True)
