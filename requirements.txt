@@ -1,20 +1,14 @@
-# WhatsApp Chatbot Dependencies
-# Install with: pip install -r requirements.txt
-
-fastapi==0.110.0
-uvicorn[standard]==0.27.1
-python-dotenv==1.0.1
-twilio==9.0.5
-python-multipart==0.0.9
-PyMySQL==1.1.1
-SQLAlchemy==2.0.28
-google-genai
-pandas==2.2.3
-nltk==3.9.1
-
-# QR Code generation
-qrcode[pil]==7.4.2
-Pillow==10.2.0
-
-# For production (session storage)
-# redis==5.0.1
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+sqlalchemy>=2.0.0
+pymysql>=1.1.0
+mysql-connector-python>=8.1.0
+python-dotenv>=1.0.0
+twilio>=8.0.0
+rapidfuzz>=3.0.0
+google-generativeai>=0.3.0
+python-multipart>=0.0.6
+qrcode>=7.4.0
+pillow>=10.0.0
+nltk>=3.8.0
+pandas>=2.0.0

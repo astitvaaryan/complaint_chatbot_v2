@@ -20,7 +20,7 @@ from app.chatbot.db import Base
 
 class EqpProcessResource(Base):
     __tablename__ = "eqp-process_resources"
-    __table_args__ = {"extend_existing": True}
+    __table_args__ = {"schema": "slotbooking", "extend_existing": True}
 
     machid = Column(Integer, primary_key=True, index=True)
     name = Column(String(150))
@@ -32,7 +32,7 @@ class EqpProcessResource(Base):
 
 class FacilityResource(Base):
     __tablename__ = "resources"
-    __table_args__ = {"extend_existing": True}
+    __table_args__ = {"schema": "facility_management", "extend_existing": True}
 
     machid = Column(Integer, primary_key=True, index=True)
     name = Column(String(150))
@@ -43,7 +43,7 @@ class FacilityResource(Base):
 
 class SafetyDevice(Base):
     __tablename__ = "safety_device"
-    __table_args__ = {"extend_existing": True}
+    __table_args__ = {"schema": "safety", "extend_existing": True}
 
     device_id = Column(Integer, primary_key=True, index=True)
     device_name = Column(String(200))
@@ -54,7 +54,7 @@ class SafetyDevice(Base):
 
 class LabIncharge(Base):
     __tablename__ = "lab_incharge"
-    __table_args__ = {"extend_existing": True}
+    __table_args__ = {"schema": "slotbooking", "extend_existing": True}
 
     locationid = Column(Integer, primary_key=True, index=True)
     location = Column(String(255))
@@ -63,17 +63,16 @@ class LabIncharge(Base):
 
 
 class Complaint(Base):
-    __tablename__ = "complaint"
+    __tablename__ = "equipment_complaint"
+    __table_args__ = {"extend_existing": True}
 
     complaint_id = Column(Integer, primary_key=True, index=True)
     member_id = Column(Integer)
     machine_id = Column(Integer, nullable=True)
-    location_name = Column(String(255))
-    location_id = Column(Integer)
     complaint_description = Column(Text, nullable=False)
-    type = Column(Integer, nullable=False)
-    status = Column(String(50), default="Open")
     time_of_complaint = Column(DateTime(timezone=True), server_default=func.now())
+    status = Column(Integer, default=1)
+    type = Column(Integer, nullable=False)
 
 
 class ConversationState(Base):
@@ -86,9 +85,20 @@ class ConversationState(Base):
 
 
 class ComplaintKeyword(Base):
-    """Keywords extracted from CSV datasets to improve classification accuracy."""
+    """Keywords specifically for IT routing accuracy."""
     __tablename__ = "complaint_it_keywords"
 
     id = Column(Integer, primary_key=True, index=True)
     keyword = Column(String(100), unique=True, index=True, nullable=False)
-    type = Column(Integer, nullable=False) # 1=Equipment ... 10=Admin
+    type = Column(Integer, nullable=False)
+
+
+class ChatbotErrorLog(Base):
+    """Tracks backend exceptions and crashes for IT telemetry."""
+    __tablename__ = "chatbot_error_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_phone = Column(String(40), index=True, nullable=True)
+    error_message = Column(Text, nullable=False)
+    stack_trace = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())

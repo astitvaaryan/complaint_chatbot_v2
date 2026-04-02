@@ -461,8 +461,9 @@ def _load_it_keywords_from_db() -> None:
     global IT_KEYWORD_SET
     db = SessionLocal()
     try:
-        rows = db.query(models.ComplaintKeyword).all()
-        for row in rows:
+        rows_it = db.query(models.ComplaintKeyword).all()
+        
+        for row in rows_it:
             keyword = (row.keyword or "").strip().lower()
             if not keyword:
                 continue

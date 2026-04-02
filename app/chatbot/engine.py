@@ -43,8 +43,7 @@ def _get_editable_fields(schema: dict) -> dict:
     if schema.get("type", 0) in RESOURCE_REQUIRED_TYPES:
         fields[idx] = "resource_name"
         idx += 1
-    if schema.get("location_name"):
-        fields[idx] = "location_name"
+    
     return fields
 
 # Types that do NOT require a physical machine / location
@@ -330,18 +329,23 @@ def _next_missing_field(schema: dict) -> str | None:
 
 def _question_for_field(field: str, complaint_type: int | None) -> str:
     type_name = TYPE_NAMES.get(complaint_type, "this")
+    res = ""
 
     if field == "complaint_description":
-        return f"I've classified this as a {type_name.lower()} complaint. What exactly is the issue?"
-    if field == "type":
-        return "I couldn't confidently identify the complaint type. Reply with one of: Miscellaneous, Equipment, Facility, Safety, Process, HR, IT, Purchase, Training, Inventory, Admin."
-    if field == "resource_name":
+        res = f"I've classified this as a {type_name.lower()} complaint. What exactly is the issue?"
+    elif field == "type":
+        res = "I couldn't confidently identify the complaint type. Reply with one of: Miscellaneous, Equipment, Facility, Safety, Process, HR, IT, Purchase, Training, Inventory, Admin."
+    elif field == "resource_name":
         if complaint_type == 0:
-            return "I couldn't confidently match this issue. If a specific tool or equipment is involved, reply with its name. Otherwise reply 'skip' and I'll register this under Miscellaneous."
-        return f"This looks like a {type_name.lower()} complaint. Which {_resource_label(complaint_type)} is affected?"
-    if field == "location_name":
-        return f"Noted. Where is this {type_name.lower()} issue happening?"
-    return f"Please provide {field}."
+            res = "I couldn't confidently match this issue. If a specific tool or equipment is involved, reply with its name. Otherwise reply 'skip' and I'll register this under Miscellaneous."
+        else:
+            res = f"This looks like a {type_name.lower()} complaint. Which {_resource_label(complaint_type)} is affected?"
+    elif field == "location_name":
+        res = f"Noted. Where is this {type_name.lower()} issue happening?"
+    else:
+        res = f"Please provide {field}."
+        
+    return res + "\n\n*(Tip: Type 'cancel' at any time to abort)*"
 
 
 def _format_candidate_options(candidates) -> str:
@@ -351,6 +355,7 @@ def _format_candidate_options(candidates) -> str:
         location = getattr(resource, "location", "")
         lines.append(f"{idx}. {label} ({location})")
     lines.append("0. Miscellaneous / none of these")
+    lines.append("\n*(Tip: Type 'cancel' at any time to abort)*")
     return "\n".join(lines)
 
 
@@ -363,45 +368,20 @@ def _render_schema(schema: dict) -> str:
     fields = _get_editable_fields(schema)
     
     lines = [
-        f"• Description: {schema.get('complaint_description', 'N/A')}",
-        f"• Location: {loc_name or 'N/A'}",
-        "",
-        "If you want to make changes, send an edit:"
+        f"*Description:* {schema.get('complaint_description', 'N/A')}",
+        f"*Type:* {type_name}",
+        f"*Tool:* {tool_name}"
     ]
-    
-    for num, field in fields.items():
-        if field == "type":
-            lines.append(f"{num}. Type: {type_name}")
-        elif field == "resource_name":
-            lines.append(f"{num}. Tool: {tool_name}")
-        elif field == "location_name":
-            lines.append(f"{num}. Location: {loc_name}")
-            
     return "\n".join(lines)
 
 def _show_confirmation(schema: dict) -> str:
     type_id = schema.get("type", 0)
     type_name = TYPE_NAMES.get(type_id, "Miscellaneous")
     
-    fields = _get_editable_fields(schema)
-    examples = []
-    for num, field in fields.items():
-        if field == "type":
-            examples.append(f"'{num}. Equipment'")
-        elif field == "resource_name":
-            examples.append(f"'{num}. SEM Tool'")
-        elif field == "location_name":
-            examples.append(f"'{num}. Reception'")
-
-    if len(examples) <= 2:
-        example_str = " or ".join(examples)
-    else:
-        example_str = ", ".join(examples[:-1]) + f", or {examples[-1]}"
-    
     return (
-        f"I've mapped this as a '{type_name}' complaint.\n\n"
+        f"I've mapped this as a *{type_name}* complaint.\n\n"
         f"Please confirm your final complaint details:\n\n{_render_schema(schema)}\n\n"
-        f"Reply 'yes' to proceed, 'no' to cancel, or send an edit by typing the list number and the new text (e.g. {example_str})."
+        f"Reply *'yes'* to proceed, *'no'* to cancel, or *'edit'* to make changes."
     )
 
 
@@ -479,7 +459,7 @@ def _parse_edit_message(message: str, schema: dict):
 
 
 def _register_complaint(db, schema: dict) -> str:
-    schema["status"] = "Open"
+    schema["status"] = 1  # 1 for Open / Unresolved
     schema["time_of_complaint"] = datetime.now()
 
     complaint = models.Complaint(
@@ -488,18 +468,15 @@ def _register_complaint(db, schema: dict) -> str:
         complaint_description=schema["complaint_description"],
         type=schema["type"],
         status=schema["status"],
-        location_name=schema.get("location_name"),
-        location_id=schema.get("location_id"),
         time_of_complaint=schema["time_of_complaint"],
     )
     db.add(complaint)
     db.commit()
 
     return (
-        "Complaint registered successfully.\n"
-        f"Type: {TYPE_NAMES.get(schema['type'], 'Unknown')}\n"
-        f"Status: {schema['status']}\n"
-        "❌ -------------------- End of complaint conversation --------------------"
+        "✅ *Complaint Registered Successfully*\n\n"
+        f"Your issue has been formally recorded under the *{TYPE_NAMES.get(schema['type'], 'General')}* category and sent to the technical team. "
+        "You may type a new message at any time to report another issue."
     )
 
 
@@ -685,20 +662,13 @@ def _handle_confirmation(db, state, message: str, user_phone: str) -> str:
         clear_state(db, user_phone)
         return "Complaint registration canceled."
 
+    if msg == "edit":
+        upsert_state(db, user_phone, "editing_menu", {"schema": schema})
+        return "What would you like to edit? Reply with the number:\n1. Type\n2. Tool"
+
     field_number, field_value = _parse_edit_message(message, schema)
     if field_number is not None:
-        original_fields = _get_editable_fields(schema)
-        field_name = original_fields.get(field_number, "field")
-        try:
-            schema = _apply_schema_edit(db, schema, field_number, field_value)
-        except ValueError:
-            return "That edited value is not valid for the selected field."
-
-        upsert_state(db, user_phone, "confirming", {"schema": schema})
-        return (
-            f"Updated {field_name.replace('_', ' ').capitalize()}.\n\n"
-            f"{_show_confirmation(schema)}"
-        )
+        return "Please reply with exactly 'edit' to make changes, or 'yes' to confirm."
 
     return "Reply 'yes' to register the complaint or 'no' to cancel."
 
@@ -755,6 +725,39 @@ def _handle_location_confirmation(db, state, message: str, user_phone: str) -> s
     return _continue_or_confirm(db, user_phone, schema)
 
 
+def _handle_editing_menu(db, state, message: str, user_phone: str) -> str:
+    data = parse_collected_data(state)
+    schema = data.get("schema", {})
+    msg = message.strip()
+    
+    if msg == "1":
+        upsert_state(db, user_phone, "editing_type", {"schema": schema})
+        return "Which type of issue is it? Reply with the number:\n1. Equipment\n2. Facility\n3. Safety\n4. Process\n5. HR\n6. IT\n7. Purchase\n8. Training\n9. Inventory\n10. Admin"
+    elif msg == "2":
+        upsert_state(db, user_phone, "editing_tool", {"schema": schema})
+        return "Please securely type the new tool name or machine identifier:"
+    else:
+        return "Please reply with '1' for Type or '2' for Tool."
+
+def _handle_editing_type(db, state, message: str, user_phone: str) -> str:
+    data = parse_collected_data(state)
+    schema = data.get("schema", {})
+    try:
+        new_type = _parse_type_value(message)
+        schema["type"] = new_type
+        upsert_state(db, user_phone, "confirming", {"schema": schema})
+        return f"✅ Type natively updated!\n\n{_show_confirmation(schema)}"
+    except ValueError:
+        return "Invalid selection. Please reply with a valid number (e.g., 1 for Equipment, 6 for IT)."
+
+def _handle_editing_tool(db, state, message: str, user_phone: str) -> str:
+    data = parse_collected_data(state)
+    schema = data.get("schema", {})
+    schema["resource_name"] = message.strip()
+    schema["machine_id"] = None
+    upsert_state(db, user_phone, "confirming", {"schema": schema})
+    return f"✅ Tool securely updated!\n\n{_show_confirmation(schema)}"
+
 def _handle_ongoing_conversation(db, state, message: str, user_phone: str) -> str:
     if state.current_step == "select_category":
         return _handle_category_selection(db, state, message, user_phone)
@@ -769,6 +772,13 @@ def _handle_ongoing_conversation(db, state, message: str, user_phone: str) -> st
     if state.current_step == "confirming":
         return _handle_confirmation(db, state, message, user_phone)
 
+    if state.current_step == "editing_menu":
+        return _handle_editing_menu(db, state, message, user_phone)
+    if state.current_step == "editing_type":
+        return _handle_editing_type(db, state, message, user_phone)
+    if state.current_step == "editing_tool":
+        return _handle_editing_tool(db, state, message, user_phone)
+
     clear_state(db, user_phone)
     return "I reset the previous conversation state. Please send your complaint again."
 
@@ -781,6 +791,9 @@ def get_chatbot_reply(user: dict, message: str) -> str:
 
     db = SessionLocal()
     try:
+        if msg_lower == "trigger_crash_test":
+            raise ValueError("Administrator manual system crash diagnostic sequence successfully intercepted.")
+
         if msg_lower in {"cancel", "reset", "stop", "abort"}:
             clear_state(db, user_phone)
             return "Current complaint flow canceled."
@@ -805,6 +818,19 @@ def get_chatbot_reply(user: dict, message: str) -> str:
     except Exception as exc:
         print(f"[ENGINE] Error: {exc}")
         traceback.print_exc()
-        return "Sorry, something went wrong. Please try again."
+        
+        try:
+            db.rollback()
+            error_log = models.ChatbotErrorLog(
+                user_phone=user_phone,
+                error_message=str(exc),
+                stack_trace=traceback.format_exc()
+            )
+            db.add(error_log)
+            db.commit()
+        except Exception as db_exc:
+            print(f"[ENGINE] Failed to save error log: {db_exc}")
+
+        return "Sorry, something went wrong processing your request. Please try again."
     finally:
         db.close()
