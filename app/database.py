@@ -10,7 +10,7 @@ DB_CONFIG = {
     "host":     os.getenv("DB_HOST", "localhost"),
     "user":     os.getenv("DB_USER", "root"),
     "password": os.getenv("DB_PASSWORD", "asti0810"),
-    "database": "slotbooking",  # login table always lives in slotbooking
+    "database": os.getenv("DB1", "slotbooking"),  # login table lives in DB1
     "port":     int(os.getenv("DB_PORT", 3306)),
     "cursorclass": pymysql.cursors.DictCursor,  # Returns rows as dicts
     "charset":  "utf8mb4",

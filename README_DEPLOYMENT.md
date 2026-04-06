@@ -1,42 +1,106 @@
-# IITBNF WhatsApp Chatbot Production Deployment Guide
+# IITBNF WhatsApp Chatbot — Startup Guide
 
-## 1. Codebase Transfer
-To pull the physical application architecture securely onto the server, physically navigate to your web root and clone out the specific production branch:
+## Step 1: Clone the Repo (first time only)
 ```bash
 git clone -b bala-schema-update [YOUR_REPO_URL]
 cd bala-chatbot
 ```
 
-## 2. Environment Configuration
-Dynamically create the secure `.env` credential file. DO NOT commit this to version control!
+If already cloned, just pull latest:
+```bash
+git pull origin bala-schema-update
+```
+
+---
+
+## Step 2: Configure `.env`
 ```bash
 cp .env.example .env
 ```
-Inside `.env`, formally inject the production Twilio credentials and specifically update the **MySQL DATABASE_URL** mathematically mapping strictly to the correct schema:
-`DATABASE_URL=mysql+pymysql://<user>:<pass>@localhost:3306/iitbnf_troubleshooting`
+Then edit `.env` and fill in the actual values:
+```
+DB_HOST=localhost
+DB_PORT=3306
+DB_USER=root
+DB_PASSWORD=your_mysql_password
 
-## 3. Dependency Injection
-Legally download the core Python packages:
+DB1=slotbooking
+DB2=facility_management
+DB3=safety
+DB4=iitbnf_troubleshooting
+
+TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxx
+TWILIO_AUTH_TOKEN=xxxxxxxxxxxxxxxx
+
+GEMINI_API_KEY=AIzaxxxxxxxxxxxxxxxx
+
+PORT=8000
+```
+
+---
+
+## Step 3: Install Dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
-**CRITICAL: NLTK Data Allocation**
-The AI categorization logic relies heavily on NLTK data blocks. You must uniquely run this exact Python command to permanently cache the language metadata into the server:
+Download NLTK data (one time only):
 ```bash
 python -c "import nltk; nltk.download('punkt'); nltk.download('stopwords'); nltk.download('wordnet')"
 ```
 
-## 4. Boot-up the Database Architecture
-Execute the physical startup script to mathematically force SQLAlchemy to magically bind all native schema representations (like the `chatbot_error_logs` telemetry table) permanently into your live MySQL server:
+---
+
+## Step 4: Set Up the Database Tables
+Run this once to create chatbot-specific tables (`conversation_state`, `chatbot_error_logs`, etc.):
 ```bash
-python -c "from app.chatbot.db import engine; from app.chatbot.models import Base; Base.metadata.create_all(bind=engine)"
+python -c "from app.chatbot.db import engine; from app.chatbot import models; models.Base.metadata.create_all(bind=engine)"
 ```
 
-## 5. Live Server Daemon Execution
-Finally, uniquely spin up the core Uvicorn ASGI execution runtime safely in the background (using `pm2`, `tmux`, `supervisor`, or `systemd`) permanently locked onto port `8000`:
+---
+
+## Step 5: Start the Server
+
+Run the server in the background — it keeps running even after you close the terminal:
 ```bash
-uvicorn main:app --host 0.0.0.0 --port 8000
+nohup uvicorn app.main:app --host 0.0.0.0 --port 8000 > server.log 2>&1 &
 ```
 
-*(Note: Don't forget to dynamically update the official Twilio Webhook callback console mapping completely to your server's public physical IP address + `/chatbot/webhook`!)*
+```bash
+# Check logs:   tail -f server.log
+# Stop server:  kill $(pgrep -f uvicorn)
+```
+
+---
+
+## Step 6: Configure Twilio Webhook
+In [Twilio Console](https://console.twilio.com) → Messaging → Sandbox Settings:
+
+Set **"When a message comes in"** to:
+```
+http://<SERVER_IP>:8000/webhook
+```
+Or if Apache proxy is configured:
+```
+https://www.cen.iitb.ac.in/webhook
+```
+
+---
+
+## Step 7: Test
+Send `Hi` to the WhatsApp sandbox number. You should get a reply from the chatbot.
+
+Check logs for any errors:
+```bash
+tail -f server.log
+```
+
+---
+
+## Database Structure (reference)
+| Env Var | Database | Tables |
+|---|---|---|
+| `DB1` | `slotbooking` | login, resources, lab_incharge |
+| `DB2` | `facility_management` | resources |
+| `DB3` | `safety` | safety_device |
+| `DB4` | `iitbnf_troubleshooting` | equipment_complaint, conversation_state, chatbot_error_logs, complaint_it_keywords |

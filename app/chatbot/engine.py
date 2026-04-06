@@ -463,12 +463,16 @@ def _register_complaint(db, schema: dict) -> str:
     schema["time_of_complaint"] = datetime.now()
 
     complaint = models.Complaint(
+        parent_id=0,
+        original_id=0,
         member_id=schema["member_id"],
-        machine_id=schema.get("machine_id"),
-        complaint_description=schema["complaint_description"],
+        allocated_to=None,
         type=schema["type"],
-        status=schema["status"],
+        machine_id=schema.get("machine_id") or 0,
         time_of_complaint=schema["time_of_complaint"],
+        status=schema["status"],
+        status_timestamp=schema["time_of_complaint"],
+        complaint_description=schema["complaint_description"],
     )
     db.add(complaint)
     db.commit()

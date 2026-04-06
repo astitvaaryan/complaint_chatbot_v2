@@ -8,7 +8,11 @@ from functools import lru_cache
 from typing import Optional
 
 from dotenv import load_dotenv
+# Gemini library import — use whichever works on your system:
+# Option 1 (newer SDK, pip install google-genai):
 from google import genai
+# Option 2 (older SDK, pip install google-generativeai):
+# import google.generativeai as genai
 
 try:
     import nltk
