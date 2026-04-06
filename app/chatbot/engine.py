@@ -2,6 +2,8 @@
 
 import json
 import re
+import os
+import requests
 import traceback
 from datetime import datetime
 
@@ -362,19 +364,36 @@ def _format_candidate_options(candidates) -> str:
 def _render_schema(schema: dict) -> str:
     type_id = schema.get("type", 0)
     type_name = TYPE_NAMES.get(type_id, "Miscellaneous")
-    tool_name = schema.get("resource_name") or (schema.get("machine_id", "Miscellaneous") if schema.get("machine_id") else "Miscellaneous")
-    loc_name = schema.get("location_name")
     
-    fields = _get_editable_fields(schema)
+    # 1=Equipment, 2=Facility, 3=Safety, 4=Process (Physical lookup types)
+    if type_id not in {1, 2, 3, 4}:
+        tool_name = type_name
+    else:
+        tool_name = schema.get("resource_name") or (schema.get("machine_id", "Miscellaneous") if schema.get("machine_id") else "Miscellaneous")
     
     lines = [
         f"*Description:* {schema.get('complaint_description', 'N/A')}",
         f"*Type:* {type_name}",
-        f"*Tool:* {tool_name}"
+        f"*Tool/Category:* {tool_name}"
     ]
     return "\n".join(lines)
 
-def _show_confirmation(schema: dict) -> str:
+
+def _get_editable_fields(schema: dict) -> dict:
+    type_id = schema.get("type", 0)
+    # The dictionary maps { field_number: field_name_in_schema }
+    # 1 is always description, 2 is always type
+    fields = {
+        1: "complaint_description",
+        2: "type"
+    }
+    # If the user is reporting a location-based issue (Facility/Safety), allow editing location
+    if type_id in {2, 3}:
+        fields[3] = "location_id"
+    return fields
+
+
+def _confirm_step_msg(schema: dict):
     type_id = schema.get("type", 0)
     type_name = TYPE_NAMES.get(type_id, "Miscellaneous")
     
@@ -383,6 +402,10 @@ def _show_confirmation(schema: dict) -> str:
         f"Please confirm your final complaint details:\n\n{_render_schema(schema)}\n\n"
         f"Reply *'yes'* to proceed, *'no'* to cancel, or *'edit'* to make changes."
     )
+
+
+def _show_confirmation(schema: dict) -> str:
+    return _confirm_step_msg(schema)
 
 
 def _coerce_edited_value(field_name: str, raw_value: str):
@@ -433,7 +456,15 @@ def _apply_schema_edit(db, schema: dict, field_number: int, raw_value: str) -> d
     value = _coerce_edited_value(field_name, raw_value)
     schema[field_name] = value
 
-    if field_name == "location_name":
+    if field_name == "type":
+        # If type changed to a non-physical one (like HR/IT), clear machine data
+        if value not in {1, 2, 3, 4}:
+            schema.pop("machine_id", None)
+            schema.pop("resource_name", None)
+            schema.pop("location_id", None)
+            schema.pop("location_name", None)
+
+    elif field_name == "location_name":
         loc_name, loc_id, _ = _resolve_lab_location(db, value)
         schema["location_name"] = loc_name
         schema["location_id"] = loc_id
@@ -459,29 +490,39 @@ def _parse_edit_message(message: str, schema: dict):
 
 
 def _register_complaint(db, schema: dict) -> str:
-    schema["status"] = 0  # 0 = Pending
-    schema["time_of_complaint"] = datetime.now()
+    url = os.getenv("PHP_API_URL")
+    if not url:
+        return "❌ *System Error*\nPHP_API_URL is not configured in the server environment. Please contact the IT Admin."
 
-    complaint = models.Complaint(
-        parent_id=0,
-        original_id=0,
-        member_id=schema["member_id"],
-        allocated_to=None,
-        type=schema["type"],
-        machine_id=schema.get("machine_id") or 0,
-        time_of_complaint=schema["time_of_complaint"],
-        status=schema["status"],
-        status_timestamp=schema["time_of_complaint"],
-        complaint_description=schema["complaint_description"],
-    )
-    db.add(complaint)
-    db.commit()
+    payload = {
+        "api_token": os.getenv("PHP_API_TOKEN", ""),
+        "member_id": schema["member_id"],
+        "type": schema["type"],
+        "machine_id": schema.get("machine_id", 0),
+        "complaint_description": schema["complaint_description"]
+    }
 
-    return (
-        "✅ *Complaint Registered Successfully*\n\n"
-        f"Your issue has been formally recorded under the *{TYPE_NAMES.get(schema['type'], 'General')}* category and sent to the technical team. "
-        "You may type a new message at any time to report another issue."
-    )
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        
+        if response.status_code == 200:
+            return (
+                f"✅ *Complaint Registered Successfully by IITBNF Server*\n\n"
+                f"Your issue has been formally recorded under the *{TYPE_NAMES.get(schema['type'], 'General')}* category and sent to the technical team. "
+                "You may type a new message at any time to report another issue."
+            )
+        else:
+            return (
+                f"❌ *Registration Failed*\n\n"
+                f"The IITBNF server rejected the complaint. (Status Code: {response.status_code})\n"
+                f"Server response: {response.text}\n"
+                "Please try again or contact the administrator."
+            )
+    except Exception as e:
+        return (
+            "❌ *Connection Error*\n\n"
+            f"Failed to reach the IITBNF server.\nDetails: {str(e)}"
+        )
 
 
 def _prepare_initial_schema(db, member_id: int, message: str):
@@ -512,10 +553,8 @@ def _prepare_initial_schema(db, member_id: int, message: str):
 
     return schema, candidates
 
-
 def _store_collection_state(db, user_phone: str, schema: dict, current_field: str):
     upsert_state(db, user_phone, "collecting_info", {"schema": schema, "current_field": current_field})
-
 
 def _store_selection_state(db, user_phone: str, schema: dict, candidates):
     upsert_state(

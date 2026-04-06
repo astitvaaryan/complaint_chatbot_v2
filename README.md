@@ -65,6 +65,10 @@ GEMINI_API_KEY=your_gemini_api_key_here
 # Twilio credentials required for async WhatsApp replies
 TWILIO_ACCOUNT_SID=AC...
 TWILIO_AUTH_TOKEN=...
+
+# PHP Backend Output (Provided by IT Admin)
+PHP_API_URL=http://localhost/api/insert_complaint_api.php
+PHP_API_TOKEN=iitbnf_api_7YxF2P9h
 ```
 
 ### 4. Import the Database

@@ -137,11 +137,18 @@ def is_account_expired(expiry_date_str: str) -> bool:
         return False
 
 
+from app.chatbot.state_manager import clear_state
+
 def handle_message(user: dict, message: str) -> str:
     """Route authenticated user messages to the chatbot engine."""
     msg_lower = message.lower().strip()
 
     if msg_lower in ["hi", "hello", "hey"]:
+        # We must clear DB state here, otherwise they get stuck in old conversations!
+        from app.chatbot.db import SessionLocal
+        db = SessionLocal()
+        clear_state(db, user.get("mobile", "unknown"))
+        
         return (
             f"Hello, {user['fname']}! 👋\n"
             f"Just tell me what the issue is, and I'll route it correctly."
@@ -174,6 +181,11 @@ def _admit_user(mobile: str, user: dict, incoming_msg: str) -> str:
     msg_lower = incoming_msg.lower().strip()
 
     if msg_lower in ["hi", "hello", "hey", ""]:
+        # Safety wipe
+        from app.chatbot.db import SessionLocal
+        db = SessionLocal()
+        clear_state(db, mobile)
+        
         return (
             f"Welcome, {user['fname']}! 👋\n"
             f"Just tell me what the issue is, and I'll route it correctly."

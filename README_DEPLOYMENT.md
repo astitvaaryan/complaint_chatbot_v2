@@ -34,6 +34,9 @@ TWILIO_AUTH_TOKEN=xxxxxxxxxxxxxxxx
 
 GEMINI_API_KEY=AIzaxxxxxxxxxxxxxxxx
 
+PHP_API_URL=http://localhost/api/insert_complaint_api.php
+PHP_API_TOKEN=iitbnf_api_7YxF2P9h
+
 PORT=8000
 ```
 

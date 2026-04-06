@@ -11,3 +11,7 @@ build/
 *.log
 chatbot_qr_*.png
 chatbot_links.json
+
+# Local Testing / Deployment Scripts
+test_api.py
+insert_complaint_api.php
