@@ -50,30 +50,52 @@ Create a file named `.env` in the root folder, and fill it like this:
 DB_HOST=localhost
 DB_USER=root
 DB_PASSWORD=your_mysql_password
-DB_NAME=slotbooking
 DB_PORT=3306
+
+DB1=slotbooking
+DB2=facility_management
+DB3=safety
+DB4=iitbnf_troubleshooting
 
 PORT=8000
 
 # Get a free Gemini API key from https://aistudio.google.com
 GEMINI_API_KEY=your_gemini_api_key_here
+
+# Twilio credentials required for async WhatsApp replies
+TWILIO_ACCOUNT_SID=AC...
+TWILIO_AUTH_TOKEN=...
 ```
 
 ### 4. Import the Database
-You need MySQL installed. Import the provided `.sql` files into a database named `slotbooking`.
+You need MySQL installed. Create the four required databases and import your schema files:
 ```bash
 mysql -u root -p
+```
+```sql
 CREATE DATABASE slotbooking;
+CREATE DATABASE facility_management;
+CREATE DATABASE safety;
+CREATE DATABASE iitbnf_troubleshooting;
+
+-- Import core tables into their respective databases
 USE slotbooking;
 SOURCE login.sql;
-SOURCE equipment_complaint.sql;
 SOURCE lab_incharge.sql;
+
+USE facility_management;
 SOURCE facility_resources.sql;
+```
+
+Then, run the migration script to automatically generate the chatbot's internal routing tables (like complaints, conversation states, and error logs) inside `iitbnf_troubleshooting`:
+```bash
+python -c "from app.chatbot.db import engine; from app.chatbot import models; models.Base.metadata.create_all(bind=engine)"
 ```
 
 ### 5. Whitelist Your Phone Number in the DB
 Since the chatbot blocks unknown numbers, you must add your own phone number to your local database to test it. Open MySQL and run:
 ```sql
+USE slotbooking;
 INSERT INTO login (fname, lname, mobile, email, position, expiry_date) 
 VALUES ('YourName', 'Test', '+919876543210', 'test@example.com', 'Researcher', '31/12/2030');
 ```
@@ -87,17 +109,33 @@ The server will start running at `http://localhost:8000`.
 
 ### 7. Expose Server to the Internet (ngrok)
 To allow Twilio to reach your local server, you need `ngrok`.
-1. Download ngrok from [https://ngrok.com/download](https://ngrok.com/download).
-2. Unzip it and place `ngrok.exe` in your project folder (or add it to your PATH).
-3. Log in to your ngrok dashboard, copy your Authtoken, and run:
+
+**For Windows:**
+1. Download from [ngrok.com/download](https://ngrok.com/download), unzip, and place `ngrok.exe` in this folder.
+2. Log in to your ngrok dashboard, copy your Authtoken, and run:
+   ```cmd
+   ngrok.exe config add-authtoken YOUR_AUTHTOKEN_HERE
+   ```
+3. Run ngrok in a new terminal:
+   ```cmd
+   ngrok.exe http 8000
+   ```
+4. Copy the `Forwarding` URL printed in the terminal (e.g., `https://1234-abcd.ngrok-free.app`).
+
+**For Linux:**
+1. Install ngrok via snap:
+   ```bash
+   sudo snap install ngrok
+   ```
+2. Add your authtoken:
    ```bash
    ngrok config add-authtoken YOUR_AUTHTOKEN_HERE
    ```
-4. In a **new terminal window**, start ngrok:
+3. Run ngrok:
    ```bash
    ngrok http 8000
    ```
-5. Copy the `Forwarding` URL it gives you (e.g., `https://1234-abcd.ngrok-free.app`).
+4. Copy the `Forwarding` URL printed in the terminal.
 
 ### 8. Configure Twilio Sandbox
 1. Go to [console.twilio.com](https://console.twilio.com) and sign up for a free account.

@@ -73,21 +73,53 @@ nohup uvicorn app.main:app --host 0.0.0.0 --port 8000 > server.log 2>&1 &
 
 ---
 
-## Step 6: Configure Twilio Webhook
+## Step 6: Expose Server to the Internet (ngrok)
+
+If the server doesn't have a public IP or Apache proxy configured yet, use ngrok to expose port 8000.
+
+**For Linux:**
+1. Install ngrok via snap:
+   ```bash
+   sudo snap install ngrok
+   ```
+2. Add your authtoken (get from your ngrok dashboard):
+   ```bash
+   ngrok config add-authtoken YOUR_AUTHTOKEN_HERE
+   ```
+3. Run ngrok in the background using `nohup`:
+   ```bash
+   nohup ngrok http 8000 > ngrok.log 2>&1 &
+   ```
+4. To find the public URL ngrok assigned you, run:
+   ```bash
+   curl -s http://localhost:4040/api/tunnels | grep -q 'tunnels' && curl -s http://localhost:4040/api/tunnels | grep -o 'https://[^"]*ngrok-free.app'
+   ```
+
+**For Windows:**
+1. Download from [ngrok.com/download](https://ngrok.com/download), unzip, and place `ngrok.exe` in this folder.
+2. Add your authtoken:
+   ```cmd
+   ngrok.exe config add-authtoken YOUR_AUTHTOKEN_HERE
+   ```
+3. Run ngrok:
+   ```cmd
+   ngrok.exe http 8000
+   ```
+4. Copy the `Forwarding` URL printed in the terminal.
+
+---
+
+## Step 7: Configure Twilio Webhook
 In [Twilio Console](https://console.twilio.com) → Messaging → Sandbox Settings:
 
-Set **"When a message comes in"** to:
+Set **"When a message comes in"** to either your Apache proxy URL, or your ngrok URL combined with `/webhook`. Example:
 ```
-http://<SERVER_IP>:8000/webhook
-```
-Or if Apache proxy is configured:
-```
-https://www.cen.iitb.ac.in/webhook
+https://xxxx-xxxx.ngrok-free.app/webhook
 ```
 
 ---
 
-## Step 7: Test
+## Step 8: Test
 Send `Hi` to the WhatsApp sandbox number. You should get a reply from the chatbot.
 
 Check logs for any errors:
