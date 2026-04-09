@@ -32,7 +32,6 @@ from app.chatbot.extractor import search_resource_candidates
 load_dotenv()
 
 TYPE_NAMES = {
-    0: "Miscellaneous",
     1: "Equipment",
     2: "Facility",
     3: "Safety",
@@ -47,10 +46,6 @@ TYPE_NAMES = {
 VALID_TYPES = set(TYPE_NAMES.keys())
 
 TYPE_NAME_TO_ID = {
-    "miscellaneous": 0,
-    "misc": 0,
-    "other": 0,
-    "unknown": 0,
     "equipment": 1,
     "facility": 2,
     "safety": 3,
@@ -63,27 +58,8 @@ TYPE_NAME_TO_ID = {
     "admin": 10,
 }
 
-CATEGORY_TYPE_MAP: dict[str, int] = {
-    "De humidifiers": 2,
-    "DG Set": 2,
-    "AC": 2,
-    "AHU": 2,
-    "Chiller": 2,
-    "Exhaust Blower": 2,
-    "UPS": 2,
-    "N2 Plant": 2,
-    "Lithography": 1,
-    "Deposition": 1,
-    "Etch": 1,
-    "Characterization": 1,
-    "Metrology": 1,
-    "Thermal": 1,
-    "Implant": 1,
-    "CMP": 1,
-    "Wet Process": 1,
-    "Safety": 3,
-    "Process": 4,
-}
+# Category to Type mappings are now handled purely by contextual and direct table lookups.
+# The 'category' column from legacy resources tables is no longer used.
 
 _BASE_KEYWORDS: dict[int, list[str]] = {
     1: ["equipment", "instrument", "device", "tool", "repair", "maintenance", "machine", "broken", "malfunction"],
@@ -491,7 +467,7 @@ def _load_it_keywords_from_db() -> None:
 _load_it_keywords_from_db()
 
 
-def classify_local(keywords: list[str], equipment_list: list[str], facility_list: list[str], safety_list: list[str]):
+def classify_complaint_type_local(keywords: list[str], equipment_list: list[str], facility_list: list[str], safety_list: list[str]):
     equipment_set = set(equipment_list)
     facility_set = set(facility_list)
     safety_set = set(safety_list)
@@ -534,15 +510,11 @@ def _detect_type_from_tables(message: str) -> Optional[int]:
                 if not rows:
                     continue
 
-                matched = rows[0]
                 if candidate_type == 3:
                     return 3
                 if candidate_type == 2:
                     return 2
 
-                category = getattr(matched, "category", None)
-                if category and category in CATEGORY_TYPE_MAP:
-                    return CATEGORY_TYPE_MAP[category]
                 return candidate_type
     except Exception as exc:
         print(f"[CLASSIFIER] Table detection failed: {exc}")
@@ -608,11 +580,12 @@ def _gemini_classify(message: str) -> Optional[int]:
         if not client:
             return None
 
-        prompt = f"""You are classifying a workplace / lab complaint message.
+        prompt = f"""You are classifying a workplace / lab complaint message. 
+If the message is generic, ambiguous, or refers to a lab machine but isn't specific, you MUST reply with 1 (Equipment).
+There is NO "Miscellaneous" category.
 
 Reply with ONLY one number:
-0=Miscellaneous
-1=Equipment
+1=Equipment (Default for any general/unclear issues)
 2=Facility
 3=Safety
 4=Process
@@ -623,17 +596,18 @@ Reply with ONLY one number:
 9=Inventory
 10=Admin
 
-If the complaint is unclear, generic, or cannot be confidently matched, reply 0.
-
 Message: "{message}"
 Reply:"""
 
         response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
         result = response.text.strip()
         if result.upper() == "UNCLEAR":
-            return 0
-        type_num = int(result)
-        return type_num if type_num in VALID_TYPES else None
+            return 1
+        try:
+            type_num = int(result)
+            return type_num if type_num in VALID_TYPES else 1
+        except ValueError:
+            return 1
     except Exception as exc:
         if "RESOURCE_EXHAUSTED" in str(exc) or "429" in str(exc):
             _set_gemini_backoff(120.0)
@@ -648,10 +622,7 @@ def classify_complaint_type(message: str, matched_machine=None) -> Optional[int]
             return 3
         if cls_name == "FacilityResource":
             return 2
-        if getattr(matched_machine, "category", None):
-            category = matched_machine.category.strip()
-            if category in CATEGORY_TYPE_MAP:
-                return CATEGORY_TYPE_MAP[category]
+        return 1  # Default to Equipment if matched but no specific type assigned
 
     for preferred_type in (5, 7, 8, 9, 10):
         if _has_base_keyword(message, preferred_type):
@@ -758,7 +729,7 @@ def process_complaint(text, equipment_list, facility_list, safety_list):
     words = normalize(words)
     keywords = extract_keywords(words)
     all_terms = generate_phrases(keywords)
-    category = classify_local(all_terms, equipment_list, facility_list, safety_list)
-    if category != "Unknown":
-        return category
+    complaint_type = classify_complaint_type_local(all_terms, equipment_list, facility_list, safety_list)
+    if complaint_type != "Unknown":
+        return complaint_type
     return "USE_GEMINI"

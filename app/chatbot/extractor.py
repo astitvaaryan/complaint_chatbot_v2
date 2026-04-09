@@ -146,17 +146,70 @@ def _narrow_by_location(location_hint: str, rows: Iterable[object], location_get
         if hint in _normalize_text(location_getter(row) or "")
     ]
 
+def search_by_location(db, complaint_type: int, location_hint: str) -> List[object]:
+    """Layer 2 Fallback: Fetch all active resources for a specific location string."""
+    if complaint_type not in RESOURCE_TABLE_MAP:
+        return []
+    
+    config = RESOURCE_TABLE_MAP[complaint_type]
+    model = config["model"]
+    active_field = getattr(model, config["active_field"])
+    
+    # Base query for active devices
+    q = db.query(model).filter(active_field == config["active_value"])
+    if complaint_type in [1, 2, 4]:
+        q = q.filter(model.display != 3)
+    
+    all_rows = q.all()
+    hint_norm = _normalize_text(location_hint)
+    
+    if not hint_norm:
+        return []
+
+    # Match rows where the location column contains our hint
+    matched = [
+        row for row in all_rows
+        if hint_norm in _normalize_text(getattr(row, config["location_field"], "") or "")
+    ]
+    return matched
+
+
 def search_resource_candidates(db, complaint_type: int, lookup_text: str, location_hint: str | None = None) -> List[object]:
-    """Fallback legacy support using RapidFuzz Tier 1."""
+    """
+    Core search logic for Physical Types (1-4).
+    Layer 1: Word-based name match.
+    Layer 2: Multi-Lab fallback (if name match fails).
+    """
     if complaint_type not in RESOURCE_TABLE_MAP:
         return []
         
-    res = _tier1_physical_search(db, [lookup_text])
+    # Layer 1: Try direct name match first
+    candidates = _tier1_physical_search(db, [lookup_text]).get(complaint_type, [])
     
-    candidates = res.get(complaint_type, [])
+    # If Facility (2) has no matches, allow a quick check of Equipment (1) names
     if not candidates and complaint_type == 2:
-        candidates = res.get(1, [])  # Fallback to Equipment
+        candidates = _tier1_physical_search(db, [lookup_text]).get(1, [])
         
+    # Layer 2: If no direct name match, but we have a lab name, show everything in that lab
+    if not candidates and location_hint:
+        # location_hint might contain multiple labs separated by commas/text
+        # We split and search for each recognized lab
+        labs = [l.strip() for l in re.split(r"[,/]", location_hint) if l.strip()]
+        for lab in labs:
+            candidates.extend(search_by_location(db, complaint_type, lab))
+            
+        # Deduplicate
+        seen_ids = set()
+        unique_candidates = []
+        id_field = RESOURCE_TABLE_MAP[complaint_type]["id_field"]
+        for c in candidates:
+            cid = getattr(c, id_field)
+            if cid not in seen_ids:
+                unique_candidates.append(c)
+                seen_ids.add(cid)
+        candidates = unique_candidates
+
+    # If we have too many candidates still, try to narrow them by location_hint if provided
     if len(candidates) > 1 and location_hint:
         config = RESOURCE_TABLE_MAP.get(complaint_type, RESOURCE_TABLE_MAP[1])
         narrowed = _narrow_by_location(
@@ -167,7 +220,13 @@ def search_resource_candidates(db, complaint_type: int, lookup_text: str, locati
         if narrowed:
             candidates = narrowed
 
-    return candidates
+    # Limit to top 15 results to prevent WhatsApp message bloat
+    return candidates[:15]
+
 
 def extract_machine_db(message: str, db) -> List[models.EqpProcessResource]:
-    return search_resource_candidates(db, 1, message)
+    return search_candidate_objects(db, 1, message)
+
+def search_candidate_objects(db, complaint_type: int, message: str) -> List[object]:
+    """Wrapper for backward compatibility."""
+    return search_resource_candidates(db, complaint_type, message)

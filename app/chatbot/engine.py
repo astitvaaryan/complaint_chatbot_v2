@@ -36,6 +36,7 @@ TYPE_NAMES = {
 
 YES_WORDS = {"yes", "y", "confirm", "ok", "okay"}
 NO_WORDS = {"no", "n", "cancel"}
+EDIT_WORDS = {"edit", "e"}
 RESOURCE_REQUIRED_TYPES = {1, 2, 3, 4}
 LOCATION_RELEVANT_TYPES = {0, 1, 2, 3, 4, 9}
 
@@ -193,29 +194,40 @@ def _resolve_schema_location(db, schema: dict, clear_unresolved: bool = False) -
 
 
 def _resolve_resource_candidates(db, schema: dict, raw_message: str):
-    complaint_type = schema.get("type")
+    complaint_type = schema.get("type", 1)
     if complaint_type not in RESOURCE_TABLE_MAP:
         return []
 
     query_candidates = []
+    
+    # Layer 1: Build list of potential tool names from schema and message
     resource_name = schema.get("resource_name")
     if resource_name:
         query_candidates.append(resource_name)
 
     for key in ("important_phrases", "important_terms"):
         values = schema.get(key) or []
-        for value in values[:6]:
-            if value and value not in query_candidates:
-                query_candidates.append(value)
+        for v in values[:6]:
+            if v and v not in query_candidates:
+                query_candidates.append(v)
 
     if raw_message and raw_message not in query_candidates:
         query_candidates.append(raw_message)
 
+    # Layer 1: Look for matches by name/word in the database
     for query in query_candidates:
         rows = search_resource_candidates(db, complaint_type, query, schema.get("location_name"))
         if rows:
             return rows
 
+    # Layer 2: If no name match, but we have lab names, try fetching EVERYTHING in those labs
+    location_name = schema.get("location_name")
+    if location_name:
+        rows = search_resource_candidates(db, complaint_type, "FALLBACK_TO_LOCATION", location_name)
+        if rows:
+            return rows
+
+    # Layer 3: No tool found, no lab found. Return empty so the bot can default to Miscellaneous.
     return []
 
 
@@ -362,13 +374,15 @@ def _format_candidate_options(candidates) -> str:
 
 
 def _render_schema(schema: dict) -> str:
-    type_id = schema.get("type", 0)
-    type_name = TYPE_NAMES.get(type_id, "Miscellaneous")
+    type_id = schema.get("type", 1)
+    type_name = TYPE_NAMES.get(type_id, "Equipment")
     
-    # 1=Equipment, 2=Facility, 3=Safety, 4=Process (Physical lookup types)
+    # rule: 1=Equipment, 2=Facility, 3=Safety, 4=Process -> category is the tool/resource
+    # else (5-10) -> category is just the type name itself
     if type_id not in {1, 2, 3, 4}:
         tool_name = type_name
     else:
+        # Default to "Miscellaneous" string if tool not found in table
         tool_name = schema.get("resource_name") or (schema.get("machine_id", "Miscellaneous") if schema.get("machine_id") else "Miscellaneous")
     
     lines = [
@@ -380,14 +394,12 @@ def _render_schema(schema: dict) -> str:
 
 
 def _get_editable_fields(schema: dict) -> dict:
-    type_id = schema.get("type", 0)
-    # The dictionary maps { field_number: field_name_in_schema }
-    # 1 is always description, 2 is always type
+    type_id = schema.get("type", 1)
     fields = {
         1: "complaint_description",
         2: "type"
     }
-    # If the user is reporting a location-based issue (Facility/Safety), allow editing location
+    # Location relevant fields: Facility (2), Safety (3)
     if type_id in {2, 3}:
         fields[3] = "location_id"
     return fields
@@ -400,7 +412,7 @@ def _confirm_step_msg(schema: dict):
     return (
         f"I've mapped this as a *{type_name}* complaint.\n\n"
         f"Please confirm your final complaint details:\n\n{_render_schema(schema)}\n\n"
-        f"Reply *'yes'* to proceed, *'no'* to cancel, or *'edit'* to make changes."
+        f"Reply *'y'* to proceed, *'n'* to cancel, or *'e'* to edit type."
     )
 
 
@@ -600,11 +612,15 @@ def _continue_or_confirm(db, user_phone: str, schema: dict, candidates=None) -> 
 
     next_field = _next_missing_field(schema)
     if next_field:
-        if next_field == "resource_name" and not schema.get("resource_name"):
-            _store_collection_state(db, user_phone, schema, next_field)
-            if complaint_type == 0:
-                return _question_for_field(next_field, complaint_type)
-            return "I could not find a specific match for your issue. Please properly describe the equipment or issue again."
+        # Layer 3 Fallback: If we can't find a tool after searching names and labs,
+        # just label it Miscellaneous and proceed to confirmation screen.
+        if next_field == "resource_name" and (complaint_type in RESOURCE_REQUIRED_TYPES or (complaint_type in {1,2,3,4})):
+            schema["resource_name"] = "Miscellaneous"
+            schema["machine_id"] = None
+            # After setting these, re-check if we can confirm
+            upsert_state(db, user_phone, "confirming", {"schema": schema})
+            return _show_confirmation(schema)
+            
         _store_collection_state(db, user_phone, schema, next_field)
         return _question_for_field(next_field, complaint_type)
 
@@ -705,9 +721,12 @@ def _handle_confirmation(db, state, message: str, user_phone: str) -> str:
         clear_state(db, user_phone)
         return "Complaint registration canceled."
 
-    if msg == "edit":
-        upsert_state(db, user_phone, "editing_menu", {"schema": schema})
-        return "What would you like to edit? Reply with the number:\n1. Type\n2. Tool"
+    if msg in EDIT_WORDS:
+        upsert_state(db, user_phone, "editing_type", {"schema": schema})
+        lines = ["What is the correct Type? Reply with the number:"]
+        for i in range(1, 11):
+            lines.append(f"{i}. {TYPE_NAMES.get(i)}")
+        return "\n".join(lines)
 
     field_number, field_value = _parse_edit_message(message, schema)
     if field_number is not None:
@@ -752,35 +771,16 @@ def _handle_category_selection(db, state, message: str, user_phone: str) -> str:
     return _continue_or_confirm(db, user_phone, schema, candidates)
 
 
-def _handle_location_confirmation(db, state, message: str, user_phone: str) -> str:
-    data = parse_collected_data(state)
-    schema = data.get("schema", {})
-    msg = message.lower().strip()
-    
     if msg in YES_WORDS:
         pass
     elif msg in NO_WORDS:
         schema["location_name"] = None
         schema["location_id"] = None
     else:
-        return "Please reply 'yes' or 'no'."
+        return "Please reply 'y' or 'n'."
         
     return _continue_or_confirm(db, user_phone, schema)
 
-
-def _handle_editing_menu(db, state, message: str, user_phone: str) -> str:
-    data = parse_collected_data(state)
-    schema = data.get("schema", {})
-    msg = message.strip()
-    
-    if msg == "1":
-        upsert_state(db, user_phone, "editing_type", {"schema": schema})
-        return "Which type of issue is it? Reply with the number:\n1. Equipment\n2. Facility\n3. Safety\n4. Process\n5. HR\n6. IT\n7. Purchase\n8. Training\n9. Inventory\n10. Admin"
-    elif msg == "2":
-        upsert_state(db, user_phone, "editing_tool", {"schema": schema})
-        return "Please securely type the new tool name or machine identifier:"
-    else:
-        return "Please reply with '1' for Type or '2' for Tool."
 
 def _handle_editing_type(db, state, message: str, user_phone: str) -> str:
     data = parse_collected_data(state)
@@ -788,18 +788,14 @@ def _handle_editing_type(db, state, message: str, user_phone: str) -> str:
     try:
         new_type = _parse_type_value(message)
         schema["type"] = new_type
+        # When type changes, we should clear the old machine match
+        schema["machine_id"] = None
+        schema["resource_name"] = None
+        
         upsert_state(db, user_phone, "confirming", {"schema": schema})
-        return f"✅ Type natively updated!\n\n{_show_confirmation(schema)}"
+        return _continue_or_confirm(db, user_phone, schema)
     except ValueError:
-        return "Invalid selection. Please reply with a valid number (e.g., 1 for Equipment, 6 for IT)."
-
-def _handle_editing_tool(db, state, message: str, user_phone: str) -> str:
-    data = parse_collected_data(state)
-    schema = data.get("schema", {})
-    schema["resource_name"] = message.strip()
-    schema["machine_id"] = None
-    upsert_state(db, user_phone, "confirming", {"schema": schema})
-    return f"✅ Tool securely updated!\n\n{_show_confirmation(schema)}"
+        return "Invalid selection. Please reply with a valid type (e.g., Equipment, Facility, Safety, IT, HR)."
 
 def _handle_ongoing_conversation(db, state, message: str, user_phone: str) -> str:
     if state.current_step == "select_category":
@@ -815,12 +811,8 @@ def _handle_ongoing_conversation(db, state, message: str, user_phone: str) -> st
     if state.current_step == "confirming":
         return _handle_confirmation(db, state, message, user_phone)
 
-    if state.current_step == "editing_menu":
-        return _handle_editing_menu(db, state, message, user_phone)
     if state.current_step == "editing_type":
         return _handle_editing_type(db, state, message, user_phone)
-    if state.current_step == "editing_tool":
-        return _handle_editing_tool(db, state, message, user_phone)
 
     clear_state(db, user_phone)
     return "I reset the previous conversation state. Please send your complaint again."

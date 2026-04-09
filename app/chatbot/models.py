@@ -29,7 +29,6 @@ class EqpProcessResource(Base):
     location = Column(String(250))
     activation_status = Column(Integer)
     isworking = Column(Integer, default=1)
-    category = Column(String(50))
     display = Column(Integer, nullable=True)
 
 
@@ -41,7 +40,6 @@ class FacilityResource(Base):
     name = Column(String(150))
     location = Column(String(250))
     activation_status = Column(Integer)
-    category = Column(String(50))
     display = Column(Integer, nullable=True)
 
 
@@ -52,7 +50,6 @@ class SafetyDevice(Base):
     device_id = Column(Integer, primary_key=True, index=True)
     device_name = Column(String(200))
     location = Column(Integer)
-    # category = Column(String(255))
     isworking = Column(Integer)
 
 
