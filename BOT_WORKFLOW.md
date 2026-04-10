@@ -126,9 +126,9 @@ The bot currently uses these type IDs:
 
 | Type ID | Type Name |
 |---|---|
-| 1 | Equipment |
-| 2 | Facility |
-| 3 | Safety |
+| 1 | Equipment (Strict machine requirement) |
+| 2 | Facility (Area-based, optional tool) |
+| 3 | Safety (Area-based, optional tool) |
 | 4 | Process |
 | 5 | HR |
 | 6 | IT |
@@ -136,6 +136,8 @@ The bot currently uses these type IDs:
 | 8 | Training |
 | 9 | Inventory |
 | 10 | Admin |
+
+**Note: Type 0 (Miscellaneous) has been purged.** If a complaint cannot be classified, the system defaults to Type 1 (Equipment) to ensure it follows a professional workflow.
 
 ## 5. High-Level Runtime Flow
 
@@ -189,10 +191,9 @@ It:
   - `resource_name`
   - `location_name`
 
-Gemini is cached and rate-limited through backoff logic:
-
+- Gemini is cached and rate-limited through backoff logic:
 - `_extract_with_gemini()` uses `@lru_cache`
-- if Gemini returns `429` or `RESOURCE_EXHAUSTED`, the system temporarily disables Gemini calls and falls back locally
+- If Gemini returns `429` (Rate Limit) or `503` (Service Unavailable), the system applies a **30-second backoff** and falls back to local NLP logic to ensure 0% downtime.
 
 The extracted values are merged into the schema.
 
@@ -257,12 +258,13 @@ The union of these matches becomes `_rf_categories` in the schema.
 The classifier logic in `classify_complaint_type()` currently works in this order:
 
 1. if a matched physical DB row is already known, use that signal
-2. strong curated keyword checks for non-physical categories
-3. table-based detection using extracted resource phrases and DB search
-4. IT keyword detection using `complaint_it_keywords`
-5. generic keyword scoring
-6. Gemini classification fallback
-7. tie-break priority if needed
+2. strong curated keyword checks for non-physical categories (HR, Admin, etc.)
+3. **IT Priority Guard Layer 1:** Check for base IT keywords (laptop, wifi, password) → return IT immediately.
+4. **Physical Table Search:** Search Equipment/Facility/Safety DB.
+5. **IT Priority Guard Layer 2:** Check broader DB-loaded IT keywords ONLY if table search found nothing.
+6. generic keyword scoring
+7. Gemini classification fallback
+8. Final fallback to Type 1 (Equipment) instead of 0.
 
 Important points:
 
@@ -419,7 +421,16 @@ The user can also send:
 
 This deletes the latest complaint registered by that `member_id`.
 
-## 12. Current Resource Search Logic
+## 12. Message Delivery & Limits
+
+To prevent Twilio API crashes (HTTP 21617) and ensure WhatsApp readability:
+
+- **1600 Character Cap:** All outgoing messages are monitored. If a message exceeds 1550 characters, it is safely trimmed at the last new-line, and a note is added: _"(Note: Long description shortened for WhatsApp. Your full detailed complaint is saved in our system.)"_
+- **Tool List Capping:** When multiple tools match, the bot only shows the **Top 10** items. 
+- **Accessibility:** The `0. Miscellaneous / none of these` option is moved to the **Top** of the list (Choice 0) for faster selection on touch screens.
+- **Async Sending:** All bot replies are sent via Twilio's Async Message API (4096 char limit) to bypass TwiML constraints.
+
+## 13. Current Resource Search Logic
 
 `extractor.py` currently provides:
 

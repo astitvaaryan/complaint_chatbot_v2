@@ -616,12 +616,10 @@ def _continue_or_confirm(db, user_phone: str, schema: dict, candidates=None) -> 
 
     next_field = _next_missing_field(schema)
     if next_field:
-        # Layer 3 Fallback: If we can't find a tool after searching names and labs,
-        # just label it Miscellaneous and proceed to confirmation screen.
-        if next_field == "resource_name" and (complaint_type in RESOURCE_REQUIRED_TYPES or (complaint_type in {1,2,3,4})):
+        # Jump to Miscellaneous ONLY if we found zero candidates
+        if next_field == "resource_name" and (not candidates or len(candidates) == 0):
             schema["resource_name"] = "Miscellaneous"
             schema["machine_id"] = None
-            # After setting these, re-check if we can confirm
             upsert_state(db, user_phone, "confirming", {"schema": schema})
             return _show_confirmation(schema)
             
@@ -638,13 +636,18 @@ def _handle_resource_selection(db, state, message: str, user_phone: str) -> str:
     candidates = data.get("candidates", [])
 
     if not message.strip().isdigit():
-        schema = _fallback_to_misc(schema)
-        return "Okay, skipping the tool selection.\n\n" + _continue_or_confirm(db, user_phone, schema)
+        return "I didn't understand that. Please reply with a **number** from the list above (e.g., 1, 2, or 0)."
 
     choice = int(message.strip())
-    if choice == 0 or choice < 1 or choice > len(candidates):
+    
+    # Handle Miscellaneous selection (0)
+    if choice == 0:
         schema = _fallback_to_misc(schema)
-        return "Okay, skipping the tool selection.\n\n" + _continue_or_confirm(db, user_phone, schema)
+        return _continue_or_confirm(db, user_phone, schema)
+
+    # Handle numeric range validation
+    if choice < 1 or choice > len(candidates):
+        return f"Invalid selection. Please reply with a number between 0 and {min(10, len(candidates))}."
 
     selected = candidates[choice - 1]
     schema["machine_id"] = selected["machine_id"]
