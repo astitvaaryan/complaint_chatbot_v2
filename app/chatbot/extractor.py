@@ -13,6 +13,8 @@ STOP_WORDS = {
     "since", "down", "off", "from", "there", "its", "our", "please",
     "help", "check", "seems", "started", "stopped", "suddenly", "always",
     "complaint", "device", "equipment", "machine", "resource", "safety",
+    "automatic", "manual", "system", "standard", "unit", "module", "device",
+    "kindly", "verify", "replace"
 }
 
 # Tier 2: Static dictionary mappings for abstract classes
@@ -25,6 +27,7 @@ ABSTRACT_MAPPINGS = {
     10: ["admin", "administration", "cleaning", "housekeeping", "security", "access", "badge", "id card"]
 }
 
+# Mapping of Type ID to database table and field names
 RESOURCE_TABLE_MAP = {
     1: {
         "model": models.EqpProcessResource,
@@ -69,13 +72,24 @@ def _extract_lookup_query(message: str) -> str:
     return " ".join(meaningful)
 
 def _tier1_physical_search(db, nouns: List[str]) -> Dict[int, List[object]]:
-    """Tier 1: Search Physical DB tables using fuzz.token_set_ratio with 65% threshold."""
+    """Tier 1: Search Physical DB tables.
+    
+    First tries exact/substring word match (catches acronyms like SEM, UPS).
+    Then falls back to fuzz.token_set_ratio with 65% threshold.
+    """
     results = {}
     
     for noun in nouns:
+        # Skip the internal fallback sentinel
+        if noun == "FALLBACK_TO_LOCATION":
+            continue
+            
         query_norm = _extract_lookup_query(noun)
         if not query_norm:
             continue
+
+        # Extract individual meaningful words from the query
+        query_words = [w for w in query_norm.split() if len(w) >= 2]
             
         for type_id in [1, 2, 3]:
             config = RESOURCE_TABLE_MAP[type_id]
@@ -93,8 +107,22 @@ def _tier1_physical_search(db, nouns: List[str]) -> Dict[int, List[object]]:
                     continue
                 name_norm = _normalize_text(name_val)
                 
-                score = fuzz.token_set_ratio(query_norm, name_norm)
-                if score >= 65.0:
+                matched = False
+                
+                # Priority check: direct word-level substring match
+                # This catches acronyms like SEM, UPS, AHU even if fuzzy score is low
+                for word in query_words:
+                    if len(word) >= 2 and re.search(r'\b' + re.escape(word) + r'\b', name_norm):
+                        matched = True
+                        break
+                
+                # Fallback: fuzzy match for longer phrases
+                if not matched:
+                    score = fuzz.token_set_ratio(query_norm, name_norm)
+                    if score >= 65.0:
+                        matched = True
+                
+                if matched:
                     if type_id not in results:
                         results[type_id] = []
                     # Keep unique objects

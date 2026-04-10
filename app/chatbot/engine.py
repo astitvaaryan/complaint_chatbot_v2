@@ -21,7 +21,6 @@ from app.chatbot.extractor import RESOURCE_TABLE_MAP, search_resource_candidates
 from app.chatbot.state_manager import clear_state, get_state, parse_collected_data, upsert_state
 
 TYPE_NAMES = {
-    0: "Miscellaneous",
     1: "Equipment",
     2: "Facility",
     3: "Safety",
@@ -38,7 +37,7 @@ YES_WORDS = {"yes", "y", "confirm", "ok", "okay"}
 NO_WORDS = {"no", "n", "cancel"}
 EDIT_WORDS = {"edit", "e"}
 RESOURCE_REQUIRED_TYPES = {1, 2, 3, 4}
-LOCATION_RELEVANT_TYPES = {0, 1, 2, 3, 4, 9}
+LOCATION_RELEVANT_TYPES = {1, 2, 3, 4, 9}
 
 def _get_editable_fields(schema: dict) -> dict:
     fields = {1: "type"}
@@ -51,7 +50,7 @@ def _get_editable_fields(schema: dict) -> dict:
 
 # Types that do NOT require a physical machine / location
 # 2=Facility, 3=Safety, 5=HR, 6=IT, etc.
-NON_EQUIPMENT_TYPES = {0, 2, 3, 5, 6, 7, 8, 9, 10}
+NON_EQUIPMENT_TYPES = {2, 3, 5, 6, 7, 8, 9, 10}
 
 
 def _blank_schema() -> dict:
@@ -71,7 +70,6 @@ def _blank_schema() -> dict:
 
 def _resource_label(complaint_type: int | None) -> str:
     return {
-        0: "tool, equipment, or affected item",
         1: "equipment",
         2: "facility resource",
         3: "safety device",
@@ -80,13 +78,17 @@ def _resource_label(complaint_type: int | None) -> str:
 
 
 def _fallback_to_misc(schema: dict) -> dict:
-    schema["type"] = 0
+    # Keep the original type (1-10) instead of resetting to 0
+    if schema.get("type") in (None, 0):
+         schema["type"] = 1 # Default only if truly unknown
+         
     schema["machine_id"] = None
     schema["resource_table"] = None
     schema["_misc_tool_skipped"] = True
     schema["_rf_candidates"] = {}
-    if not schema.get("resource_name"):
-        schema["resource_name"] = None
+    
+    # Force the display text to "Miscellaneous"
+    schema["resource_name"] = "Miscellaneous"
     return schema
 
 
@@ -363,12 +365,18 @@ def _question_for_field(field: str, complaint_type: int | None) -> str:
 
 
 def _format_candidate_options(candidates) -> str:
+    MAX_SHOW = 10  # Keep well within Twilio's limits
+    display = candidates[:MAX_SHOW]
     lines = ["I found multiple matching records. Reply with the number:"]
-    for idx, resource in enumerate(candidates, start=1):
+    
+    # Move 0 to the top for better accessibility
+    lines.append("0. Miscellaneous / none of these")
+    
+    for idx, resource in enumerate(display, start=1):
         label = getattr(resource, "name", getattr(resource, "device_name", "Unknown"))
         location = getattr(resource, "location", "")
         lines.append(f"{idx}. {label} ({location})")
-    lines.append("0. Miscellaneous / none of these")
+        
     lines.append("\n*(Tip: Type 'cancel' at any time to abort)*")
     return "\n".join(lines)
 
@@ -437,9 +445,6 @@ def _coerce_edited_value(field_name: str, raw_value: str):
 def _parse_type_value(raw_value: str):
     value = raw_value.strip().lower()
     type_map = {
-        "miscellaneous": 0,
-        "misc": 0,
-        "other": 0,
         "equipment": 1,
         "facility": 2,
         "safety": 3,
@@ -596,7 +601,6 @@ def _continue_or_confirm(db, user_phone: str, schema: dict, candidates=None) -> 
         lines = ["Which type of issue is it? Reply with the number:"]
         for idx, c in enumerate(rf_cats, start=1):
             lines.append(f"{idx}. {TYPE_NAMES.get(c, 'Unknown')}")
-        lines.append("0. Miscellaneous")
         return "\n".join(lines)
         
     if schema.pop("_require_location_confirm", False):
@@ -770,6 +774,12 @@ def _handle_category_selection(db, state, message: str, user_phone: str) -> str:
 
     return _continue_or_confirm(db, user_phone, schema, candidates)
 
+
+
+def _handle_location_confirmation(db, state, message: str, user_phone: str) -> str:
+    data = parse_collected_data(state)
+    schema = data.get("schema", {})
+    msg = message.lower().strip()
 
     if msg in YES_WORDS:
         pass

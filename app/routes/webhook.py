@@ -32,6 +32,11 @@ def _send_async_whatsapp_message(from_number: str, to_number: str, body: str) ->
         if not account_sid or not auth_token or not from_number or not to_number or not body.strip():
             return
 
+        # Twilio hard limit is 1600 chars — trim safely to avoid HTTP 21617 error
+        MAX_LEN = 1550
+        if len(body) > MAX_LEN:
+            body = body[:MAX_LEN].rsplit("\n", 1)[0] + "\n\n_(Note: Long description shortened for WhatsApp. Your full detailed complaint is saved in our system.)_"
+
         client = Client(account_sid, auth_token)
         client.messages.create(
             from_=from_number,
@@ -89,11 +94,7 @@ def respond_with_processing(
     processing_text: str,
     func, *args
 ) -> Response:
-    """Evaluate immediately for quick replies, otherwise return Loading and queue background task."""
-    if is_quick_reply(incoming_message):
-        resp.message(func(*args))
-        return twiml_response(resp)
-
+    """Always process in background and send via async Twilio API (no 1600 char TwiML limit)."""
     resp.message(processing_text)
     if from_number and to_number:
         background_tasks.add_task(_run_and_send_async, from_number, to_number, func, *args)

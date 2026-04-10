@@ -312,8 +312,12 @@ Message: "{message}"
             "location_name": extracted.get("location_name"),
         }
     except Exception as exc:
-        if "RESOURCE_EXHAUSTED" in str(exc) or "429" in str(exc):
+        exc_str = str(exc)
+        if "RESOURCE_EXHAUSTED" in exc_str or "429" in exc_str:
             _set_gemini_backoff(120.0)
+        elif "UNAVAILABLE" in exc_str or "503" in exc_str:
+            # Temporary outage — short backoff, fall through to local NLP
+            _set_gemini_backoff(30.0)
         print(f"[CLASSIFIER] Gemini term extraction error: {exc}")
         return None
 
@@ -609,8 +613,11 @@ Reply:"""
         except ValueError:
             return 1
     except Exception as exc:
-        if "RESOURCE_EXHAUSTED" in str(exc) or "429" in str(exc):
+        exc_str = str(exc)
+        if "RESOURCE_EXHAUSTED" in exc_str or "429" in exc_str:
             _set_gemini_backoff(120.0)
+        elif "UNAVAILABLE" in exc_str or "503" in exc_str:
+            _set_gemini_backoff(30.0)
         print(f"[CLASSIFIER] Gemini error: {exc}")
         return None
 
@@ -628,10 +635,20 @@ def classify_complaint_type(message: str, matched_machine=None) -> Optional[int]
         if _has_base_keyword(message, preferred_type):
             return preferred_type
 
+    # Layer A: IT base keywords (wifi, laptop, password, internet, etc.)
+    # These are strong, specific signals → check BEFORE table search
+    if _has_base_keyword(message, 6):
+        return 6
+
+    # Table search: Equipment / Facility / Safety DB
+    # If a physical resource matches, trust it over generic DB IT keywords
     table_type = _detect_type_from_tables(message)
     if table_type is not None:
         return table_type
 
+    # Layer B: IT DB keywords (broader set loaded from DB)
+    # Only runs if table search found NOTHING — prevents door/facility complaints
+    # from being tagged as IT just because a generic word matched
     if _match_it_keywords(message):
         return 6
 
@@ -645,10 +662,10 @@ def classify_complaint_type(message: str, matched_machine=None) -> Optional[int]
         return gemini_type
 
     if tied_types:
-        for preferred in [6, 3, 2, 4, 5, 7, 8, 9, 10, 1, 0]:
+        for preferred in [6, 3, 2, 4, 5, 7, 8, 9, 10, 1]:
             if preferred in tied_types:
                 return preferred
-    return 0
+    return 1
 
 
 def extract_complaint_schema(message: str, complaint_type: int | None = None) -> dict:
