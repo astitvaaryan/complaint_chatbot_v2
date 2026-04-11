@@ -5,15 +5,27 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Validate required environment variables at startup
+_DB_USER = os.getenv("DB_USER")
+_DB_PASSWORD = os.getenv("DB_PASSWORD")
+_DB_HOST = os.getenv("DB_HOST", "localhost")
+_DB_NAME = os.getenv("DB1", "slotbooking")
+_DB_PORT = int(os.getenv("DB_PORT", 3306))
+
+if not _DB_USER:
+    raise RuntimeError("FATAL: DB_USER is not set in .env. Server cannot start.")
+if not _DB_PASSWORD:
+    raise RuntimeError("FATAL: DB_PASSWORD is not set in .env. Server cannot start.")
+
 # Database configuration
 DB_CONFIG = {
-    "host":     os.getenv("DB_HOST", "localhost"),
-    "user":     os.getenv("DB_USER", "root"),
-    "password": os.getenv("DB_PASSWORD", "asti0810"),
-    "database": os.getenv("DB1", "slotbooking"),  # login table lives in DB1
-    "port":     int(os.getenv("DB_PORT", 3306)),
-    "cursorclass": pymysql.cursors.DictCursor,  # Returns rows as dicts
-    "charset":  "utf8mb4",
+    "host":      _DB_HOST,
+    "user":      _DB_USER,
+    "password":  _DB_PASSWORD,
+    "database":  _DB_NAME,
+    "port":      _DB_PORT,
+    "cursorclass": pymysql.cursors.DictCursor,
+    "charset":   "utf8mb4",
 }
 
 

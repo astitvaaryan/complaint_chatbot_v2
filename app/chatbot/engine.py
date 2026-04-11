@@ -10,7 +10,7 @@ from datetime import datetime
 from rapidfuzz import fuzz
 
 from app.chatbot import models
-from app.chatbot.classifier import (
+from app.chatbot.new_classifier import (
     classify_complaint_type,
     extract_complaint_schema,
     extract_local_complaint_schema,
