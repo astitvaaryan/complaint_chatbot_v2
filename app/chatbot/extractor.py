@@ -14,7 +14,8 @@ STOP_WORDS = {
     "help", "check", "seems", "started", "stopped", "suddenly", "always",
     "complaint", "device", "equipment", "machine", "resource", "safety",
     "automatic", "manual", "system", "standard", "unit", "module", "device",
-    "kindly", "verify", "replace"
+    "kindly", "verify", "replace", "tool", "lab", "room", "area", "bldg",
+    "floor", "building", "number", "sd", "near"
 }
 
 # Tier 2: Static dictionary mappings for abstract classes
