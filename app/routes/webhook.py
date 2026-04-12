@@ -14,7 +14,6 @@ from app.chatbot.state_manager import get_state
 
 router = APIRouter()
 
-
 def twiml_response(resp: MessagingResponse) -> Response:
     """Return a properly formatted TwiML HTTP response for Twilio."""
     return Response(
@@ -150,10 +149,7 @@ def handle_message(user: dict, message: str) -> str:
         db = SessionLocal()
         clear_state(db, user.get("mobile", "unknown"))
         
-        return (
-            f"Hello, {user['fname']}! 👋\n"
-            f"Just tell me what the issue is, and I'll route it correctly."
-        )
+        return f"Hello, {user['fname']}! 👋\nJust tell me what the issue is."
 
     if msg_lower == "whoami":
         return (
@@ -187,10 +183,7 @@ def _admit_user(mobile: str, user: dict, incoming_msg: str) -> str:
         db = SessionLocal()
         clear_state(db, mobile)
         
-        return (
-            f"Welcome, {user['fname']}! 👋\n"
-            f"Just tell me what the issue is, and I'll route it correctly."
-        )
+        return f"Hello, {user['fname']}! 👋\nJust tell me what the issue is."
 
     # Authenticate silently and process message right away
     return handle_message(user, incoming_msg)

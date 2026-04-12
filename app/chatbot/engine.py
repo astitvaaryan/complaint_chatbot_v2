@@ -39,6 +39,20 @@ EDIT_WORDS = {"edit", "e"}
 RESOURCE_REQUIRED_TYPES = {1, 2, 3, 4}
 LOCATION_RELEVANT_TYPES = {1, 2, 3, 4, 9}
 
+# Mapping: Complaint Type -> Head Role ID (from role_master)
+TYPE_TO_HEAD_ROLE = {
+    1: 1,   # Equipment Head
+    2: 2,   # Facility Head
+    3: 3,   # Safety Head
+    4: 4,   # Process Head
+    5: 12,  # HR Head
+    6: 13,  # IT Head
+    7: 14,  # Purchase Head
+    8: 18,  # Training Head
+    9: 19,  # Inventory Head
+    10: 22, # Admin Head
+}
+
 def _get_editable_fields(schema: dict) -> dict:
     fields = {1: "type"}
     idx = 2
@@ -116,13 +130,19 @@ def _score_lab_match(query: str, candidate: str) -> float:
     )
 
 
-def _resolve_lab_location(db, location_str):
-    try:
-        if not location_str:
-            return None, None, None
+def _resolve_lab_location(db, text: str):
+    """
+    Search lab_incharge table for a location name matching the text.
+    Uses fuzzy token_set_ratio.
+    """
+    from app.chatbot.extractor import _extract_lookup_query
+    text_norm = _extract_lookup_query(text)
+    if not text_norm:
+        return None, None, None
 
-        raw_location = str(location_str).strip()
-        normalized_location = _normalize_location_text(raw_location)
+    try:
+        raw_location = str(text).strip()
+        normalized_location = text_norm
 
         try:
             loc_id = int(raw_location)
@@ -130,7 +150,7 @@ def _resolve_lab_location(db, location_str):
                 models.LabIncharge.locationid == loc_id
             ).first()
             if incharge:
-                return incharge.location, incharge.locationid, incharge.memberid
+                return incharge.location, incharge.locationid, None
         except ValueError:
             pass
 
@@ -138,14 +158,14 @@ def _resolve_lab_location(db, location_str):
             models.LabIncharge.location.ilike(f"%{raw_location}%")
         ).first()
         if incharge:
-            return incharge.location, incharge.locationid, incharge.memberid
+            return incharge.location, incharge.locationid, None
 
         if normalized_location:
             incharge = db.query(models.LabIncharge).filter(
                 models.LabIncharge.location.ilike(f"%{normalized_location}%")
             ).first()
             if incharge:
-                return incharge.location, incharge.locationid, incharge.memberid
+                return incharge.location, incharge.locationid, None
 
             best_match = None
             best_score = 0.0
@@ -161,7 +181,7 @@ def _resolve_lab_location(db, location_str):
                     best_score = score
 
             if best_match and best_score >= 70.0:
-                return best_match.location, best_match.locationid, best_match.memberid
+                return best_match.location, best_match.locationid, None
     except Exception as exc:
         print(f"[ENGINE] Lab lookup failed: {exc}")
 
@@ -365,19 +385,20 @@ def _question_for_field(field: str, complaint_type: int | None) -> str:
 
 
 def _format_candidate_options(candidates) -> str:
-    MAX_SHOW = 10  # Keep well within Twilio's limits
+    MAX_SHOW = 10
     display = candidates[:MAX_SHOW]
     lines = ["I found multiple matching records. Reply with the number:"]
-    
-    # Move 0 to the top for better accessibility
-    lines.append("0. Miscellaneous / none of these")
-    
+    lines.append("0. Miscellaneous (None of these)")
+
     for idx, resource in enumerate(display, start=1):
-        label = getattr(resource, "name", getattr(resource, "device_name", "Unknown"))
-        location = getattr(resource, "location", "")
+        if isinstance(resource, dict):
+            label = resource.get("resource_name") or "Unknown"
+            location = resource.get("location_name") or ""
+        else:
+            label = getattr(resource, "name", getattr(resource, "device_name", "Unknown"))
+            location = getattr(resource, "location", "")
         lines.append(f"{idx}. {label} ({location})")
-        
-    lines.append("\n*(Tip: Type 'cancel' at any time to abort)*")
+
     return "\n".join(lines)
 
 
@@ -413,14 +434,25 @@ def _get_editable_fields(schema: dict) -> dict:
     return fields
 
 
-def _confirm_step_msg(schema: dict):
+def _type_confirm_msg(schema: dict) -> str:
+    """Step 1 message: show only the classified type and ask y/n/e."""
     type_id = schema.get("type", 0)
     type_name = TYPE_NAMES.get(type_id, "Miscellaneous")
-    
     return (
-        f"I've mapped this as a *{type_name}* complaint.\n\n"
-        f"Please confirm your final complaint details:\n\n{_render_schema(schema)}\n\n"
-        f"Reply *'y'* to proceed, *'n'* to cancel, or *'e'* to edit type."
+        f"I've classified this as an *{type_name}* complaint.\n"
+        f"Reply *'y'* to confirm, *'n'* to cancel, or *'e'* to edit the type."
+    )
+
+
+def _confirm_step_msg(schema: dict) -> str:
+    """Final review message before registration."""
+    type_id = schema.get("type", 0)
+    type_name = TYPE_NAMES.get(type_id, "Miscellaneous")
+
+    return (
+        f"Please confirm your complaint details:\n\n"
+        f"{_render_schema(schema)}\n\n"
+        f"Reply *'y'* to register, *'n'* to cancel."
     )
 
 
@@ -506,14 +538,33 @@ def _parse_edit_message(message: str, schema: dict):
     return field_number, field_value
 
 
+def _get_head_member_id(db, complaint_type: int) -> int:
+    """Find the first memberid assigned as 'Head' for a specific complaint type."""
+    role_id = TYPE_TO_HEAD_ROLE.get(complaint_type)
+    if not role_id:
+        return 0
+    
+    # role table: id, memberid, role (role_id)
+    # Pick the first head in sequence
+    head = db.query(models.Role).filter(
+        models.Role.role == role_id
+    ).order_by(models.Role.id.asc()).first()
+    
+    return head.memberid if head else 0
+
+
 def _register_complaint(db, schema: dict) -> str:
     url = os.getenv("PHP_API_URL")
     if not url:
         return "❌ *System Error*\nPHP_API_URL is not configured in the server environment. Please contact the IT Admin."
 
+    allocated_to = _get_head_member_id(db, schema.get("type", 0))
+    print(f"[ENGINE] Allocating complaint type {schema.get('type')} to member ID: {allocated_to}")
+
     payload = {
         "api_token": os.getenv("PHP_API_TOKEN", ""),
         "member_id": schema["member_id"],
+        "allocated_to": allocated_to,
         "type": schema["type"],
         "machine_id": schema.get("machine_id", 0),
         "complaint_description": schema["complaint_description"]
@@ -523,11 +574,7 @@ def _register_complaint(db, schema: dict) -> str:
         response = requests.post(url, json=payload, timeout=10)
         
         if response.status_code == 200:
-            return (
-                f"✅ *Complaint Registered Successfully by IITBNF Server*\n\n"
-                f"Your issue has been formally recorded under the *{TYPE_NAMES.get(schema['type'], 'General')}* category and sent to the technical team. "
-                "You may type a new message at any time to report another issue."
-            )
+            return f"✅ *Registered!* Your issue is now with the technical team."
         else:
             return (
                 f"❌ *Registration Failed*\n\n"
@@ -574,20 +621,28 @@ def _store_collection_state(db, user_phone: str, schema: dict, current_field: st
     upsert_state(db, user_phone, "collecting_info", {"schema": schema, "current_field": current_field})
 
 def _store_selection_state(db, user_phone: str, schema: dict, candidates):
+    processed_candidates = []
+    for resource in candidates:
+        if isinstance(resource, dict):
+            processed_candidates.append({
+                "machine_id": resource.get("machine_id"),
+                "resource_name": resource.get("resource_name"),
+                "location_name": str(resource.get("location_name", "")),
+            })
+        else:
+            processed_candidates.append({
+                "machine_id": getattr(resource, "machid", getattr(resource, "device_id", None)),
+                "resource_name": getattr(resource, "name", getattr(resource, "device_name", None)),
+                "location_name": str(getattr(resource, "location", "")),
+            })
+            
     upsert_state(
         db,
         user_phone,
         "select_resource",
         {
             "schema": schema,
-            "candidates": [
-                {
-                    "machine_id": getattr(resource, "machid", getattr(resource, "device_id", None)),
-                    "resource_name": getattr(resource, "name", getattr(resource, "device_name", None)),
-                    "location_name": str(getattr(resource, "location", "")),
-                }
-                for resource in candidates
-            ],
+            "candidates": processed_candidates,
         },
     )
 
@@ -643,7 +698,8 @@ def _handle_resource_selection(db, state, message: str, user_phone: str) -> str:
     # Handle Miscellaneous selection (0)
     if choice == 0:
         schema = _fallback_to_misc(schema)
-        return _continue_or_confirm(db, user_phone, schema)
+        upsert_state(db, user_phone, "confirming", {"schema": schema})
+        return _show_confirmation(schema)
 
     # Handle numeric range validation
     if choice < 1 or choice > len(candidates):
@@ -653,12 +709,15 @@ def _handle_resource_selection(db, state, message: str, user_phone: str) -> str:
     schema["machine_id"] = selected["machine_id"]
     schema["resource_name"] = selected["resource_name"]
 
-    if not schema.get("location_name"):
+    # Silently resolve location from the resource if not already known
+    if not schema.get("location_name") and selected.get("location_name"):
         loc_name, loc_id, _ = _resolve_lab_location(db, selected.get("location_name"))
         schema["location_name"] = loc_name or selected.get("location_name")
         schema["location_id"] = loc_id
 
-    return _continue_or_confirm(db, user_phone, schema)
+    # Per new spec: go straight to final review after tool selection
+    upsert_state(db, user_phone, "confirming", {"schema": schema})
+    return _show_confirmation(schema)
 
 
 def _handle_collecting_info(db, state, message: str, user_phone: str) -> str:
@@ -715,14 +774,12 @@ def _handle_collecting_info(db, state, message: str, user_phone: str) -> str:
     return _continue_or_confirm(db, user_phone, schema)
 
 
-def _handle_confirmation(db, state, message: str, user_phone: str) -> str:
+def _handle_type_confirmation(db, state, message: str, user_phone: str) -> str:
+    """Step 2: User confirms / cancels / edits the classified type."""
     data = parse_collected_data(state)
     schema = data.get("schema", {})
+    candidates = data.get("candidates", [])
     msg = message.lower().strip()
-
-    if msg in YES_WORDS:
-        clear_state(db, user_phone)
-        return _register_complaint(db, schema)
 
     if msg in NO_WORDS:
         clear_state(db, user_phone)
@@ -735,11 +792,51 @@ def _handle_confirmation(db, state, message: str, user_phone: str) -> str:
             lines.append(f"{i}. {TYPE_NAMES.get(i)}")
         return "\n".join(lines)
 
-    field_number, field_value = _parse_edit_message(message, schema)
-    if field_number is not None:
-        return "Please reply with exactly 'edit' to make changes, or 'yes' to confirm."
+    if msg in YES_WORDS:
+        return _trigger_tool_lookup(db, user_phone, schema, candidates)
 
-    return "Reply 'yes' to register the complaint or 'no' to cancel."
+    return "Reply *'y'* to confirm the type, *'n'* to cancel, or *'e'* to edit."
+
+
+def _trigger_tool_lookup(db, user_phone: str, schema: dict, candidates: list) -> str:
+    """After type is confirmed: show tool list for types 1-4, or go straight to final review for 5-10."""
+    complaint_type = schema.get("type", 1)
+
+    if complaint_type not in RESOURCE_REQUIRED_TYPES:
+        # Abstract type (5-10): skip tool selection, go to final review
+        type_name = TYPE_NAMES.get(complaint_type, "General")
+        schema["resource_name"] = type_name
+        schema["machine_id"] = None
+        upsert_state(db, user_phone, "confirming", {"schema": schema})
+        return _show_confirmation(schema)
+
+    # Physical type (1-4): show tool candidates
+    if candidates:
+        _store_selection_state(db, user_phone, schema, candidates)
+        return _format_candidate_options(candidates)
+
+    # No candidates found — default to Miscellaneous and go to final review
+    schema["resource_name"] = "Miscellaneous"
+    schema["machine_id"] = None
+    upsert_state(db, user_phone, "confirming", {"schema": schema})
+    return _show_confirmation(schema)
+
+
+def _handle_confirmation(db, state, message: str, user_phone: str) -> str:
+    """Final step: register or cancel after full review."""
+    data = parse_collected_data(state)
+    schema = data.get("schema", {})
+    msg = message.lower().strip()
+
+    if msg in YES_WORDS:
+        clear_state(db, user_phone)
+        return _register_complaint(db, schema)
+
+    if msg in NO_WORDS:
+        clear_state(db, user_phone)
+        return "Complaint registration canceled."
+
+    return "Reply *'y'* to register the complaint or *'n'* to cancel."
 
 
 def _handle_category_selection(db, state, message: str, user_phone: str) -> str:
@@ -801,29 +898,37 @@ def _handle_editing_type(db, state, message: str, user_phone: str) -> str:
     try:
         new_type = _parse_type_value(message)
         schema["type"] = new_type
-        # When type changes, we should clear the old machine match
+        # Clear old machine match when type changes
         schema["machine_id"] = None
         schema["resource_name"] = None
-        
-        upsert_state(db, user_phone, "confirming", {"schema": schema})
-        return _continue_or_confirm(db, user_phone, schema)
+
+        if new_type in RESOURCE_REQUIRED_TYPES:
+            # Re-run tool lookup for the new physical type using original message
+            original_msg = schema.get("complaint_description", "")
+            candidates = _resolve_resource_candidates(db, schema, original_msg)
+            return _trigger_tool_lookup(db, user_phone, schema, candidates)
+        else:
+            # Abstract type: set resource_name to type name and go to final review
+            type_name = TYPE_NAMES.get(new_type, "General")
+            schema["resource_name"] = type_name
+            upsert_state(db, user_phone, "confirming", {"schema": schema})
+            return _show_confirmation(schema)
     except ValueError:
-        return "Invalid selection. Please reply with a valid type (e.g., Equipment, Facility, Safety, IT, HR)."
+        return "Invalid selection. Please reply with a valid type number (1-10) or name (e.g., Equipment, IT, HR)."
 
 def _handle_ongoing_conversation(db, state, message: str, user_phone: str) -> str:
+    if state.current_step == "confirm_type":
+        return _handle_type_confirmation(db, state, message, user_phone)
     if state.current_step == "select_category":
         return _handle_category_selection(db, state, message, user_phone)
     if state.current_step == "confirm_location":
         return _handle_location_confirmation(db, state, message, user_phone)
     if state.current_step == "select_resource":
         return _handle_resource_selection(db, state, message, user_phone)
-
     if state.current_step == "collecting_info":
         return _handle_collecting_info(db, state, message, user_phone)
-
     if state.current_step == "confirming":
         return _handle_confirmation(db, state, message, user_phone)
-
     if state.current_step == "editing_type":
         return _handle_editing_type(db, state, message, user_phone)
 
@@ -858,8 +963,17 @@ def get_chatbot_reply(user: dict, message: str) -> str:
         if state:
             return _handle_ongoing_conversation(db, state, msg, user_phone)
 
+        # Step 1: Classify and show ONLY the type — wait for user confirmation
         schema, candidates = _prepare_initial_schema(db, member_id, msg)
-        return _continue_or_confirm(db, user_phone, schema, candidates)
+        upsert_state(db, user_phone, "confirm_type", {"schema": schema, "candidates": [
+            {
+                "machine_id": getattr(r, "machid", getattr(r, "device_id", None)),
+                "resource_name": getattr(r, "name", getattr(r, "device_name", None)),
+                "location_name": str(getattr(r, "location", "")),
+            }
+            for r in candidates
+        ]})
+        return _type_confirm_msg(schema)
     except Exception as exc:
         print(f"[ENGINE] Error: {exc}")
         traceback.print_exc()

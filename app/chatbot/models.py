@@ -59,8 +59,8 @@ class LabIncharge(Base):
 
     locationid = Column(Integer, primary_key=True, index=True)
     location = Column(String(255))
-    memberid = Column(Integer)
-    status = Column(String(50))
+    # memberid = Column(Integer)
+    # status = Column(String(50))
 
 
 class Complaint(Base):
@@ -115,3 +115,22 @@ class ChatbotErrorLog(Base):
     error_message = Column(Text, nullable=False)
     stack_trace = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class RoleMaster(Base):
+    __tablename__ = "role_master"
+    __table_args__ = {"schema": _DB4, "extend_existing": True}
+
+    role_id = Column(Integer, primary_key=True, index=True)
+    role = Column(String(100), nullable=False)
+    description = Column(String(255))
+
+
+class Role(Base):
+    __tablename__ = "role"
+    __table_args__ = {"schema": _DB4, "extend_existing": True}
+
+    id = Column(Integer, primary_key=True, index=True)
+    memberid = Column(Integer, nullable=False)
+    role = Column(Integer, nullable=False)  # role_id from role_master
+    timestamp = Column(DateTime, server_default=func.now())
