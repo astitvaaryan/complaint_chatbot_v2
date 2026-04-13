@@ -898,9 +898,10 @@ def _handle_editing_type(db, state, message: str, user_phone: str) -> str:
     try:
         new_type = _parse_type_value(message)
         schema["type"] = new_type
-        # Clear old machine match when type changes
-        schema["machine_id"] = None
-        schema["resource_name"] = None
+        
+        # Clear old tool name and machine ID when switching types
+        schema.pop("machine_id", None)
+        schema.pop("resource_name", None)
 
         if new_type in RESOURCE_REQUIRED_TYPES:
             # Re-run tool lookup for the new physical type using original message

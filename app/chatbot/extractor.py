@@ -214,10 +214,6 @@ def search_resource_candidates(db, complaint_type: int, lookup_text: str, locati
         
     # Layer 1: Try direct name match first
     candidates = _tier1_physical_search(db, [lookup_text]).get(complaint_type, [])
-    
-    # If Facility (2) has no matches, allow a quick check of Equipment (1) names
-    if not candidates and complaint_type == 2:
-        candidates = _tier1_physical_search(db, [lookup_text]).get(1, [])
         
     # Layer 2: If no direct name match, but we have a lab name, show everything in that lab
     if not candidates and location_hint:
