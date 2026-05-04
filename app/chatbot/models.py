@@ -105,6 +105,16 @@ class ComplaintKeyword(Base):
     type = Column(Integer, nullable=False)
 
 
+class ComplaintBaseKeyword(Base):
+    """Base category keywords for classification."""
+    __tablename__ = "complaint_base_keywords"
+    __table_args__ = {"schema": _DB4, "extend_existing": True}
+
+    id = Column(Integer, primary_key=True, index=True)
+    keyword = Column(String(100), unique=True, index=True, nullable=False)
+    type = Column(Integer, nullable=False)
+
+
 class ChatbotErrorLog(Base):
     """Tracks backend exceptions and crashes for IT telemetry."""
     __tablename__ = "chatbot_error_logs"

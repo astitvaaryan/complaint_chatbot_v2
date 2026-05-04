@@ -357,9 +357,6 @@ def _next_missing_field(schema: dict) -> str | None:
     if complaint_type in RESOURCE_REQUIRED_TYPES and not schema.get("machine_id"):
         return "resource_name"
 
-    if complaint_type in LOCATION_RELEVANT_TYPES and not schema.get("location_name"):
-        return "location_name"
-
     return None
 
 
@@ -376,8 +373,6 @@ def _question_for_field(field: str, complaint_type: int | None) -> str:
             res = "I couldn't confidently match this issue. If a specific tool or equipment is involved, reply with its name. Otherwise reply 'skip' and I'll register this under Miscellaneous."
         else:
             res = f"This looks like a {type_name.lower()} complaint. Which {_resource_label(complaint_type)} is affected?"
-    elif field == "location_name":
-        res = f"Noted. Where is this {type_name.lower()} issue happening?"
     else:
         res = f"Please provide {field}."
         
@@ -702,8 +697,9 @@ def _handle_resource_selection(db, state, message: str, user_phone: str) -> str:
         return _show_confirmation(schema)
 
     # Handle numeric range validation
-    if choice < 1 or choice > len(candidates):
-        return f"Invalid selection. Please reply with a number between 0 and {min(10, len(candidates))}."
+    max_choice = min(10, len(candidates))
+    if choice < 1 or choice > max_choice:
+        return f"Invalid selection. Please reply with a number between 0 and {max_choice}."
 
     selected = candidates[choice - 1]
     schema["machine_id"] = selected["machine_id"]
@@ -732,13 +728,10 @@ def _handle_collecting_info(db, state, message: str, user_phone: str) -> str:
     if current_field == "complaint_description":
         schema["complaint_description"] = answer
     elif current_field == "type":
-        schema["type"] = _parse_type_value(answer)
-    elif current_field == "location_name":
-        loc_name, loc_id, _ = _resolve_lab_location(db, answer)
-        if loc_id is None:
-            return "I could not find that location in our records. Please enter the lab name as stored in the system."
-        schema["location_name"] = loc_name
-        schema["location_id"] = loc_id
+        try:
+            schema["type"] = _parse_type_value(answer)
+        except ValueError:
+            return "Invalid selection. Please reply with a valid type number (1-10) or name."
     elif current_field == "resource_name":
         if schema.get("type") == 0 and answer.lower() == "skip":
             schema["resource_name"] = None
@@ -845,13 +838,11 @@ def _handle_category_selection(db, state, message: str, user_phone: str) -> str:
     categories = data.get("categories", [])
     
     if not message.strip().isdigit():
-        schema = _fallback_to_misc(schema)
-        return "I couldn't map that selection to a valid category, so I'm routing this to Miscellaneous.\n\n" + _continue_or_confirm(db, user_phone, schema)
+        return f"I didn't understand that. Please reply with a **number** between 1 and {len(categories)} to select a category."
         
     choice = int(message.strip())
-    if choice == 0 or choice < 1 or choice > len(categories):
-        schema = _fallback_to_misc(schema)
-        return "I couldn't map that selection to a valid category, so I'm routing this to Miscellaneous.\n\n" + _continue_or_confirm(db, user_phone, schema)
+    if choice < 1 or choice > len(categories):
+        return f"Invalid selection. Please reply with a number between 1 and {len(categories)}."
         
     selected_cat = categories[choice - 1]
     schema["type"] = selected_cat

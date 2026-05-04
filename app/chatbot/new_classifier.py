@@ -61,19 +61,28 @@ TYPE_NAME_TO_ID = {
 # Category to Type mappings are now handled purely by contextual and direct table lookups.
 # The 'category' column from legacy resources tables is no longer used.
 
-_BASE_KEYWORDS: dict[int, list[str]] = {
-    1: ["equipment", "instrument", "device", "tool", "repair", "maintenance", "machine", "broken", "malfunction"],
-    2: ["ac", "air conditioning", "hvac", "ahu", "chiller", "dg set", "ups", "generator", "blower", "dehumidifier"],
-    3: ["fire", "smoke", "hazard", "safety", "accident", "emergency", "spill", "gas leak", "alarm", "detector"],
-    4: ["process", "recipe", "parameter", "wafer", "yield", "sop", "uniformity", "contamination"],
-    5: ["salary", "payroll", "leave", "attendance", "holiday", "hr", "reimbursement", "appraisal", "promotion", "office", "recruitment", "letter"],
-    6: ["laptop", "computer", "printer", "wifi", "internet", "network", "vpn", "email", "password", "software", "login", "usb", "mouse", "keyboard"],
-    7: ["purchase", "procurement", "order", "vendor", "supplier", "invoice", "quote", "chemical", "consumable", "spare"],
-    8: ["training", "workshop", "course", "seminar", "certification", "orientation", "session"],
-    9: ["inventory", "stock", "missing item", "spare parts", "shortage", "out of stock", "reorder", "asset"],
-    10: ["admin", "permission", "access", "approval", "policy", "document", "gate pass", "certificate", "noc"],
-}
-KEYWORD_TYPE_MAP: dict[int, list[str]] = {k: list(v) for k, v in _BASE_KEYWORDS.items()}
+_BASE_KEYWORDS: dict[int, list[str]] = {}
+KEYWORD_TYPE_MAP: dict[int, list[str]] = {}
+
+def _load_base_keywords() -> None:
+    global _BASE_KEYWORDS, KEYWORD_TYPE_MAP
+    if _BASE_KEYWORDS:
+        return
+    db = SessionLocal()
+    try:
+        rows = db.query(models.ComplaintBaseKeyword).all()
+        mapping = {}
+        for row in rows:
+            if row.type not in mapping:
+                mapping[row.type] = []
+            mapping[row.type].append(row.keyword)
+        
+        _BASE_KEYWORDS = mapping
+        KEYWORD_TYPE_MAP = {k: list(v) for k, v in _BASE_KEYWORDS.items()}
+    except Exception as exc:
+        print(f"[CLASSIFIER] Failed to load base keywords: {exc}")
+    finally:
+        db.close()
 
 LOCAL_STOP_WORDS = {
     "the", "a", "an", "and", "or", "but", "with", "for", "from", "this", "that",
@@ -545,6 +554,7 @@ def _match_it_keywords(message: str) -> bool:
 
 
 def _has_base_keyword(message: str, complaint_type: int) -> bool:
+    _load_base_keywords()
     msg_lower = message.lower()
     for keyword in _BASE_KEYWORDS.get(complaint_type, []):
         if re.search(r"\b" + re.escape(keyword) + r"\b", msg_lower):
@@ -553,6 +563,7 @@ def _has_base_keyword(message: str, complaint_type: int) -> bool:
 
 
 def keyword_match(message: str) -> Optional[int]:
+    _load_base_keywords()
     msg_lower = message.lower()
     scores: dict[int, int] = {}
 
@@ -623,6 +634,7 @@ Reply:"""
 
 
 def classify_complaint_type(message: str, matched_machine=None) -> Optional[int]:
+    _load_base_keywords()
     if matched_machine:
         cls_name = type(matched_machine).__name__
         if cls_name == "SafetyDevice":
